@@ -3,6 +3,7 @@
 
 # OpenCode configuration (user-specific agents, skills, etc.)
 .opencode/
+opencode.jsonc
 
 # Python
 __pycache__/
