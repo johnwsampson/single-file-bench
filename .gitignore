@@ -1,0 +1,61 @@
+# .scripts_hold - staging area for scripts awaiting promotion
+.scripts_hold/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs
+*.log
+scripts/*_log.tsv
+
+# Testing
+.coverage
+.pytest_cache/
+htmlcov/
+.tox/
+
+# Secrets
+scripts/.secrets
+.env
+.env.local
+
+# Backup directories (created by fw tools)
+.syne/backups/
+
+# Temporary files
+*.tmp
+*.temp
+/tmp/
