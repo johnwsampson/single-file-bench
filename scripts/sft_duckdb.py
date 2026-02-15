@@ -317,23 +317,6 @@ def main():
             if not tables:
                 print("No tables found")
             else:
-    @mcp.tool()
-    def schema(db_path: str) -> str:
-        """Get complete schema for all tables in database.
-        
-        Args:
-            db_path: Path to the DuckDB database file
-        """
-        tables, _ = _list_tables_impl(db_path)
-        if not tables:
-            return "No tables found"
-        
-        schemas = []
-        for t in tables:
-            schema, _ = _describe_table_impl(db_path, t)
-            schemas.append(f"=== {t} ===\n{schema}")
-        
-        return "\n\n".join(schemas)
                 for t in tables:
                     schema, _ = _describe_table_impl(args.database, t)
                     print(f"\n=== {t} ===")
@@ -405,6 +388,24 @@ def _run_mcp():
         """
         result, _ = _query_impl(db_path, question, max_iterations)
         return result
+
+    @mcp.tool()
+    def schema(db_path: str) -> str:
+        """Get complete schema for all tables in database.
+        
+        Args:
+            db_path: Path to the DuckDB database file
+        """
+        tables, _ = _list_tables_impl(db_path)
+        if not tables:
+            return "No tables found"
+        
+        schemas = []
+        for t in tables:
+            table_schema, _ = _describe_table_impl(db_path, t)
+            schemas.append(f"=== {t} ===\n{table_schema}")
+        
+        return "\n\n".join(schemas)
 
     print("Starting MCP server...", file=sys.stderr)
     mcp.run(transport="stdio")

@@ -58,13 +58,25 @@ mypy scripts/                   # Type check
 No unit tests. Scripts use inline `assert` for runtime invariants.
 Verification is manual: run the script, check its `.log` file.
 
+**Required before promoting any script:**
 ```bash
-# Verify a change manually
+# 1. Syntax validation - must pass
+python3 -m py_compile scripts/sft_*.py
+
+# 2. SPEC compliance check - must pass
+./scripts/sft_check.py check scripts/sft_*.py
+
+# 3. MCP server startup test (for scripts with MCP) - must start without errors
+./scripts/sft_*.py mcp-stdio &
+sleep 2
+kill %1
+
+# 4. Version flag test
+./scripts/sft_*.py -V
+
+# 5. Manual verification
 ./scripts/sft_web.py search "test query"
 tail -20 scripts/sft_web_log.tsv
-
-# Compliance check (all scripts must pass)
-./scripts/sft_check.py check scripts/sft_*.py
 ```
 
 ## Mandatory Pre-Work
