@@ -1,6 +1,9 @@
 # .scripts_hold - staging area for scripts awaiting promotion
 .scripts_hold/
 
+# OpenCode configuration (user-specific agents, skills, etc.)
+.opencode/
+
 # Python
 __pycache__/
 *.py[cod]
