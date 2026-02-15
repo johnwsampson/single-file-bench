@@ -1239,12 +1239,22 @@ def _search_impl(
     # 3. Fallback: Python
     import fnmatch
 
+    # Directories to exclude from search (performance optimization)
+    EXCLUDE_DIRS = {
+        ".git", "__pycache__", ".scripts_hold", ".syne",
+        "node_modules", "venv", ".venv", "env",
+        "build", "dist", ".tox", ".pytest_cache",
+        ".eggs", "*.egg-info", "htmlcov"
+    }
+
     if root_path.is_file():
         files_to_search = [root_path]
         cwd_path = root_path.parent
     else:
         files_to_search = []
-        for root, _, files in os.walk(root_path):
+        for root, dirs, files in os.walk(root_path):
+            # Skip excluded directories (modifies dirs in-place to prevent recursion)
+            dirs[:] = [d for d in dirs if d not in EXCLUDE_DIRS and not d.startswith(".")]
             for filename in files:
                 if include and not fnmatch.fnmatch(filename, include):
                     continue
