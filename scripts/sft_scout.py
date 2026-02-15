@@ -1241,7 +1241,7 @@ def _search_impl(
 
     # Directories to exclude from search (performance optimization)
     EXCLUDE_DIRS = {
-        ".git", "__pycache__", ".scripts_hold", ".syne",
+        ".git", "__pycache__", ".scripts_hold",
         "node_modules", "venv", ".venv", "env",
         "build", "dist", ".tox", ".pytest_cache",
         ".eggs", "*.egg-info", "htmlcov"

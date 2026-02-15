@@ -56,8 +56,8 @@ scripts/.secrets
 .env
 .env.local
 
-# Backup directories (created by fw tools)
-.syne/backups/
+# Backup directories
+.sfb/backups/
 
 # Temporary files
 *.tmp
