@@ -29,10 +29,10 @@ Self-contained Python CLI tools. Each script exposes three interfaces from one f
 
 ```bash
 # Run any script directly (uv resolves PEP 723 inline dependencies)
-./scripts/sft_web.py search "climate change"
+./scripts/sft_web.py search "opencode"
 
 # Pipe between tools
-echo "climate change" | ./scripts/sft_web.py search | jq '.results[].url'
+echo "opencode" | ./scripts/sft_web.py search | jq '.results[].url'
 
 # Run as MCP server for agent consumption
 ./scripts/sft_web.py mcp-stdio
