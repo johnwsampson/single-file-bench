@@ -25,8 +25,8 @@ from pathlib import Path
 # =============================================================================
 _LEVELS = {"TRACE": 5, "DEBUG": 10, "INFO": 20, "WARN": 30, "ERROR": 40, "FATAL": 50}
 # Environment variables are external - defensive access appropriate
-_THRESHOLD = _LEVELS.get(os.environ.get("SFA_LOG_LEVEL", "INFO"), 20)
-_LOG_DIR = os.environ.get("SFA_LOG_DIR", "")
+_THRESHOLD = _LEVELS.get(os.environ.get("SFB_LOG_LEVEL", "INFO"), 20)
+_LOG_DIR = os.environ.get("SFB_LOG_DIR", "")
 _SCRIPT = Path(__file__).stem
 _LOG = (
     Path(_LOG_DIR) / f"{_SCRIPT}_log.tsv"
@@ -371,10 +371,10 @@ def _check_impl(filepath: str) -> tuple[dict, dict]:
         tsv_issues.append("missing _LEVELS dict")
     if "_HEADER" not in content:
         tsv_issues.append("missing _HEADER with TSV columns")
-    if "SFA_LOG_LEVEL" not in content:
-        tsv_issues.append("missing SFA_LOG_LEVEL env var support")
-    if "SFA_LOG_DIR" not in content:
-        tsv_issues.append("missing SFA_LOG_DIR env var support")
+    if "SFB_LOG_LEVEL" not in content:
+        tsv_issues.append("missing SFB_LOG_LEVEL env var support")
+    if "SFB_LOG_DIR" not in content:
+        tsv_issues.append("missing SFB_LOG_DIR env var support")
     if "_log.tsv" not in content and "_log.tsv" not in content:
         tsv_issues.append("log file should be _log.tsv not .log")
     if tsv_issues:
@@ -506,6 +506,20 @@ def _check_impl(filepath: str) -> tuple[dict, dict]:
             _pass("pydantic_function_tools", "LLM script uses Pydantic models with Field descriptions")
     else:
         _pass("pydantic_function_tools", "N/A - script does not use LLM APIs")
+
+    # ---- 21. stdin must not block mcp-stdio (Principle 4) ----
+    # Eager stdin reading before mcp-stdio dispatch starves the MCP transport.
+    # Bad pattern: isatty() guard appears before `args.command == "mcp-stdio"` dispatch.
+    if cli_section:
+        isatty_pos = cli_section.find("isatty()")
+        mcp_match = re.search(r"""args\.command\s*==\s*['"]mcp-stdio['"]""", cli_section)
+        mcp_dispatch_pos = mcp_match.start() if mcp_match else -1
+        if isatty_pos >= 0 and mcp_dispatch_pos >= 0 and isatty_pos < mcp_dispatch_pos:
+            _fail("stdin_mcp_safe",
+                  "stdin reading appears before mcp-stdio dispatch — will block MCP transport. "
+                  "Dispatch mcp-stdio first or read stdin per-command.")
+        else:
+            _pass("stdin_mcp_safe")
 
     # ---- Build result ----
     compliant = failed == 0
