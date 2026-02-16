@@ -13,7 +13,7 @@
 - LLM function calling with Pydantic models
 
 **SFB builds upon this foundation:**
-- **Four architectural roles** (Tools, Servers, Agents, Daemons) organized by function
+- **Four architectural roles** (Tools, Servers, Agents, Loops) organized by function
 - **Triple interface** — Every script exposes CLI + Import + MCP (Model Context Protocol)
 - **Structured TSV logging** — Queryable observability with standard unix tools
 - **Negative space programming** — Assert contracts, fail loud, zero defensive coding
@@ -21,21 +21,21 @@
 - **Unix-native** — First-class stdin/stdout piping support
 
 Self-contained Python CLI tools. Each script exposes three interfaces from one file:
-- **CLI** — `./scripts/sft_web.py search "query"`
+- **CLI** — `uv run --script scripts/sft_web.py search "query"`
 - **Import** — `from sft_web import _search_impl`
-- **MCP** — `./scripts/sft_web.py mcp-stdio` (FastMCP over stdio)
+- **MCP** — `uv run --script scripts/sft_web.py mcp-stdio` (FastMCP over stdio)
 
 ## Quick Start
 
 ```bash
 # Run any script directly (uv resolves PEP 723 inline dependencies)
-./scripts/sft_web.py search "opencode"
+uv run --script scripts/sft_web.py search "opencode"
 
 # Pipe between tools
-echo "opencode" | ./scripts/sft_web.py search | jq '.results[].url'
+echo "opencode" | uv run --script scripts/sft_web.py search | jq '.results[].url'
 
 # Run as MCP server for agent consumption
-./scripts/sft_web.py mcp-stdio
+uv run --script scripts/sft_web.py mcp-stdio
 ```
 
 **Requirements:** [uv](https://github.com/astral-sh/uv) (Astral). No pip, no virtualenv, no requirements.txt.
@@ -44,7 +44,7 @@ echo "opencode" | ./scripts/sft_web.py search | jq '.results[].url'
 
 Each script is fully self-contained via [PEP 723](https://peps.python.org/pep-0723/) inline metadata. Dependencies are declared in the script header and resolved by `uv` at runtime. No shared environment, no dependency conflicts between scripts.
 
-Scripts follow a mandatory structure: PEP 723 header, logging block, configuration, core functions, CLI interface, FastMCP server. See [SPEC_SFA.md](SPEC_SFA.md) for the full specification.
+Scripts follow a mandatory structure: PEP 723 header, logging block, configuration, core functions, CLI interface, FastMCP server. See [SPEC_SFB.md](SPEC_SFB.md) for the full specification.
 
 ## Key Design Principles
 
@@ -55,37 +55,69 @@ Scripts follow a mandatory structure: PEP 723 header, logging block, configurati
 5. **Negative space programming** — Assert contracts, fail loud. No defensive coding.
 6. **Semantic versioning** — Every script versioned. Changes tracked in [CHANGELOG.md](CHANGELOG.md).
 
-See [SPEC_SFA.md](SPEC_SFA.md) for the full 10-principle specification.
+See [SPEC_SFB.md](SPEC_SFB.md) for the full 11-principle specification.
 
 ## Compliance
 
-The `sfa_` prefix is a certification mark. Only scripts that pass all spec principles earn it.
+The `sft_`, `sfs_`, `sfa_`, `sfl_` prefixes are certification marks. Only scripts that pass all spec principles earn them.
 
 ```bash
 # Check a single script
-./scripts/sfa_check.py check scripts/sfa_web.py
+uv run --script scripts/sft_check.py check scripts/sft_web.py
 
-# Check all SFA scripts
-./scripts/sfa_check.py check scripts/sfa_*.py
+# Check all SFB scripts
+uv run --script scripts/sft_check.py check scripts/sft_*.py scripts/sfs_*.py scripts/sfa_*.py scripts/sfl_*.py
 ```
 
 ## Scripts
 
-### Tools (sft_)
+### Tools (`sft_`)
 | Script | MCP | Description |
 |--------|-----|-------------|
-| `sft_web.py` | `web` | Search (SearXNG), fetch URLs to markdown |
-| `sft_check.py` | `check` | SFB compliance checker |
-| `sft_scout.py` | `fs` | Code reconnaissance, search, python_view |
+| `sft_web.py` | `web` | Web search (SearXNG) and URL fetch to markdown |
+| `sft_check.py` | `check` | SFB spec compliance checker |
+| `sft_scout.py` | `fs` | Code reconnaissance — AST analysis, file search, content search |
 | `sft_file_read.py` | `fr` | Read-only file operations and inspection |
-| `sft_file_write.py` | `fw` | Destructive file operations with backup system |
-| `sft_duckdb.py` | `duckdb` | Natural language SQL queries with AI assistance |
-| `sft_jq.py` | `jq` | Natural language JSON processing with jq |
+| `sft_file_write.py` | `fw` | Destructive file ops with automatic backup system |
+| `sft_brain.py` | `brain` | FOQA knowledge store with semantic search |
+| `sft_recall.py` | `recall` | Unified search across all brain tables |
+| `sft_reason.py` | `reason` | Persistent structured thinking with branches |
+| `sft_track.py` | `track` | Task tracking with hierarchy, deps, and passdowns |
+| `sft_chat_history_oc.py` | `chat_history_oc` | OpenCode session reader for context recovery |
+| `sft_duckdb.py` | `duckdb` | Natural language SQL queries via LLM |
+| `sft_jq.py` | `jq` | Natural language JSON processing via jq |
+| `sft_context7.py` | `context7` | Library documentation via Context7 API |
+| `sft_chrome.py` | `chrome` | Chrome automation via CDP — sandbox/work/personal profiles |
+| `sft_clipboard.py` | `clip` | System clipboard read/write |
+| `sft_chart.py` | `viz` | Data visualization and chart generation as HTML |
+| `sft_tmux.py` | `tmux` | Tmux session orchestration — spawn, control, message |
+| `sft_openrouter_models.py` | `models` | OpenRouter model catalog — list, search, compare |
+| `sft_audio_analyze.py` | `audio_analyze` | Audio analysis — key, tempo, spectral, dynamics |
+| `sft_speech2text.py` | `whisper` | Speech-to-text transcription |
+| `sft_grepcode.py` | `repo_grep` | Code search across GitHub repos via Grep.app |
+| `sft_docx2md.py` | `docx2md` | Word (.docx) to markdown conversion |
+| `sft_md2html.py` | `md2html` | Markdown to styled HTML with mermaid diagrams |
+| `sft_x.py` | `x` | X/Twitter and web search via xAI Grok API |
 
-### Loop Agents (sfl_)
+### Servers (`sfs_`)
 | Script | MCP | Description |
 |--------|-----|-------------|
-| `sfl_test_gen.py` | `test_gen` | Iterative test generation until coverage threshold met |
+| `sfs_events.py` | `events` | Event bus — pub/sub for agent orchestration |
+| `sfs_tts_stt_server.py` | `tts-stt-server` | Voice server — Kokoro TTS + browser speech recognition |
+
+### Agents (`sfa_`)
+| Script | MCP | Description |
+|--------|-----|-------------|
+| `sfa_notebooklm.py` | `notebooklm` | NotebookLM API client |
+| `sfa_tts_edge.py` | `tts-edge` | Text-to-speech via Microsoft Edge TTS |
+| `sfa_tts_kokoro.py` | `tts-kokoro` | Native Kokoro-82M TTS with Apple Silicon MPS |
+| `sfa_voice_kokoro_docker.py` | `kokoro-docker` | Kokoro TTS via Docker with auto-start |
+| `sfa_youtube_video.py` | `ytv` | YouTube video info, transcripts, channel search |
+
+### Loop Agents (`sfl_`)
+| Script | MCP | Description |
+|--------|-----|-------------|
+| `sfl_test_gen.py` | `test_gen` | Iterative test generation until coverage threshold |
 
 ## Development
 
@@ -95,13 +127,13 @@ ruff check scripts/ --fix
 ruff format scripts/
 
 # Manual verification (no unit tests — scripts use runtime assertions)
-./scripts/sfa_web.py search "test query"
-tail -20 scripts/sfa_web_log.tsv
+uv run --script scripts/sft_web.py search "test query"
+tail -20 scripts/sft_web_log.tsv
 ```
 
 ## Documentation
 
-- [SPEC_SFA.md](SPEC_SFA.md) — Full specification (11 principles)
+- [SPEC_SFB.md](SPEC_SFB.md) — Full specification (11 principles)
 - [AGENTS.md](AGENTS.md) — Quick reference for agentic coding assistants
 - [CHANGELOG.md](CHANGELOG.md) — DR/RFC change tracking
 - [scripts/README.md](scripts/README.md) — Complete script index by bench type
