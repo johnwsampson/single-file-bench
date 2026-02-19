@@ -34,6 +34,7 @@ import re
 import sys
 import time
 import urllib.parse
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -45,8 +46,8 @@ import httpx
 # LOGGING (TSV format — see SPEC_SFA.md Principle 6)
 # =============================================================================
 _LEVELS = {"TRACE": 5, "DEBUG": 10, "INFO": 20, "WARN": 30, "ERROR": 40, "FATAL": 50}
-_THRESHOLD = _LEVELS.get(os.environ.get("SFA_LOG_LEVEL", "INFO"), 20)
-_LOG_DIR = os.environ.get("SFA_LOG_DIR", "")
+_THRESHOLD = _LEVELS.get(os.environ.get("SFB_LOG_LEVEL", "INFO"), 20)
+_LOG_DIR = os.environ.get("SFB_LOG_DIR", "")
 _SCRIPT = Path(__file__).stem
 _LOG = Path(_LOG_DIR) / f"{_SCRIPT}_log.tsv" if _LOG_DIR else Path(__file__).parent / f"{_SCRIPT}_log.tsv"
 _HEADER = "#timestamp\tscript\tlevel\tevent\tmessage\tdetail\tmetrics\ttrace\n"
@@ -78,6 +79,7 @@ EXPOSED = [
 
 BASE_URL = "https://notebooklm.google.com"
 BATCHEXECUTE_URL = f"{BASE_URL}/_/LabsTailwindUi/data/batchexecute"
+QUERY_URL = f"{BASE_URL}/_/LabsTailwindUi/data/google.internal.labs.tailwind.orchestration.v1.LabsTailwindOrchestrationService/GenerateFreeFormStreamed"
 UPLOAD_URL = "https://notebooklm.google.com/upload/_/"
 BL_VERSION = "boq_labs-tailwind-frontend_20260108.06_p0"
 
@@ -120,6 +122,13 @@ VIDEO_STYLES = {
     "auto_select": 1, "custom": 2, "classic": 3, "whiteboard": 4,
     "kawaii": 5, "anime": 6, "watercolor": 7, "retro_print": 8,
     "heritage": 9, "paper_craft": 10,
+}
+
+# Report formats
+REPORT_FORMATS = {
+    "Briefing Doc": ("Briefing Doc", "A comprehensive briefing document", "Write a detailed briefing document that covers all key points from the sources."),
+    "Study Guide": ("Study Guide", "A study guide for learning", "Create a comprehensive study guide with key concepts, definitions, and review questions."),
+    "Blog Post": ("Blog Post", "An engaging blog post", "Write an engaging and informative blog post based on the source material."),
 }
 
 
@@ -433,6 +442,88 @@ class NotebookLMClient:
                                     return result_str
                             return result_str
         return None
+
+    def _extract_answer_from_chunk(self, json_str: str) -> tuple[str | None, bool]:
+        """Extract answer text and type from streaming response chunk.
+        
+        Returns:
+            Tuple of (answer_text, is_final_answer)
+            Type 1 = final answer, Type 2 = thinking step
+        """
+        try:
+            data = json.loads(json_str)
+            if not isinstance(data, list) or len(data) < 1:
+                return None, False
+            answer_text = data[0][0] if isinstance(data[0], list) and len(data[0]) > 0 else None
+            is_answer = False
+            if isinstance(data[0], list) and len(data[0]) > 4 and isinstance(data[0][4], list):
+                type_indicator = data[0][4][-1] if data[0][4] else None
+                is_answer = type_indicator == 1
+            return answer_text, is_answer
+        except (json.JSONDecodeError, IndexError, TypeError):
+            return None, False
+    
+    def _parse_query_response(self, response_text: str) -> str:
+        """Parse streaming query response and extract answer.
+        
+        Returns:
+            The answer text (longest chunk where type == 1, or longest overall)
+        """
+        if response_text.startswith(")]}'"):
+            response_text = response_text[4:]
+        
+        lines = response_text.strip().split("\n")
+        chunks = []
+        i = 0
+        
+        while i < len(lines):
+            line = lines[i].strip()
+            if not line:
+                i += 1
+                continue
+            
+            # Check if this is a length line
+            try:
+                int(line)
+                i += 1
+                if i < len(lines):
+                    # Next line should be JSON
+                    chunks.append(lines[i])
+                i += 1
+            except ValueError:
+                # Not a length line, try to parse as JSON
+                chunks.append(line)
+                i += 1
+        
+        # Extract answers from all chunks
+        answer_chunks = []
+        thinking_chunks = []
+        
+        for chunk_text in chunks:
+            try:
+                chunk_data = json.loads(chunk_text)
+                if isinstance(chunk_data, list):
+                    for item in chunk_data:
+                        if isinstance(item, list) and len(item) >= 3 and item[0] == "wrb.fr":
+                            inner_json = item[2]
+                            if isinstance(inner_json, str):
+                                answer_text, is_answer = self._extract_answer_from_chunk(inner_json)
+                                if answer_text:
+                                    if is_answer:
+                                        answer_chunks.append(answer_text)
+                                    else:
+                                        thinking_chunks.append(answer_text)
+            except (json.JSONDecodeError, IndexError, TypeError):
+                pass
+        
+        # Return longest answer chunk, or longest thinking chunk if no answers
+        if answer_chunks:
+            return max(answer_chunks, key=len)
+        elif thinking_chunks:
+            return max(thinking_chunks, key=len)
+        else:
+            raise RuntimeError("No answer extracted from response")
+
     
     def _call_rpc(self, rpc_id: str, params: Any, path: str = "/",
                   timeout: float | None = None, _retry: bool = False) -> Any:
@@ -705,24 +796,79 @@ class NotebookLMClient:
         MCP: query
         """
         start_ms = time.time() * 1000
-        # Simplified query implementation
+        
+        # Get source IDs
         sources, _ = self.list_sources_impl(notebook_id)
         source_ids = [s["id"] for s in sources if s.get("id")]
         
-        if not source_ids:
-            latency = round(time.time() * 1000 - start_ms, 2)
-            return {"answer": "No sources found in notebook.", "sources": []}, {"status": "success", "latency_ms": latency}
+        assert source_ids, "No sources found in notebook"
         
-        # This is a simplified response - full implementation would call the query endpoint
-        latency = round(time.time() * 1000 - start_ms, 2)
-        metrics = {"status": "success", "latency_ms": latency, "source_count": len(source_ids)}
-        return {
-            "answer": f"Query processed for notebook {notebook_id} with {len(source_ids)} sources.",
-            "question": question,
-            "notebook_id": notebook_id,
-            "sources": source_ids,
-        }, metrics
-    
+        # Build streaming request
+        sources_array = [[[sid]] for sid in source_ids]
+        params = [
+            sources_array,
+            question,
+            None,  # conversation history
+            [2, None, [1]],  # fixed config
+            str(uuid.uuid4()),  # conversation ID
+        ]
+        
+        params_json = json.dumps(params, separators=(",", ":"))
+        f_req = [None, params_json]
+        f_req_json = json.dumps(f_req, separators=(",", ":"))
+        
+        body_parts = [f"f.req={urllib.parse.quote(f_req_json, safe='')}"]
+        if self.csrf_token:
+            body_parts.append(f"at={urllib.parse.quote(self.csrf_token, safe='')}")
+        body = "&".join(body_parts) + "&"
+        
+        self._reqid_counter += 100000
+        url_params = {
+            "bl": os.environ.get("NOTEBOOKLM_BL", BL_VERSION),
+            "hl": "en",
+            "_reqid": str(self._reqid_counter),
+            "rt": "c",
+        }
+        if self._session_id:
+            url_params["f.sid"] = self._session_id
+        url = f"{QUERY_URL}?{urllib.parse.urlencode(url_params)}"
+        
+        _log("DEBUG", "query_call", f"Querying notebook {notebook_id}")
+        
+        try:
+            client = self._get_client()
+            response = client.post(url, content=body, timeout=120.0)
+            response.raise_for_status()
+            answer_text = self._parse_query_response(response.text)
+            assert answer_text, "No answer extracted from response"
+            
+            latency = round(time.time() * 1000 - start_ms, 2)
+            metrics = {"status": "success", "latency_ms": latency, "source_count": len(source_ids)}
+            return {"answer": answer_text, "question": question, "notebook_id": notebook_id}, metrics
+            
+        except (httpx.HTTPStatusError, RuntimeError) as e:
+            is_auth = isinstance(e, RuntimeError) or (
+                isinstance(e, httpx.HTTPStatusError) and e.response.status_code in (400, 401, 403)
+            )
+            if is_auth:
+                _log("WARN", "auth_refresh", "Refreshing auth tokens for query")
+                try:
+                    self._refresh_auth_tokens_impl()
+                    self._client = None
+                    # Retry once
+                    client = self._get_client()
+                    response = client.post(url, content=body, timeout=120.0)
+                    response.raise_for_status()
+                    answer_text = self._parse_query_response(response.text)
+                    assert answer_text, "No answer extracted from response"
+                    
+                    latency = round(time.time() * 1000 - start_ms, 2)
+                    metrics = {"status": "success", "latency_ms": latency, "source_count": len(source_ids)}
+                    return {"answer": answer_text, "question": question, "notebook_id": notebook_id}, metrics
+                except Exception:
+                    raise RuntimeError("Authentication expired. Run 'sfa_notebooklm.py login'.") from None
+            raise
+
     # === Audio Overview ===
     
     def create_audio_overview_impl(self, notebook_id: str, format_code: int = 1, 
@@ -814,15 +960,54 @@ class NotebookLMClient:
             latency = round(time.time() * 1000 - start_ms, 2)
             return {"error": "No sources in notebook"}, {"status": "error", "latency_ms": latency}
         
-        # Simplified report creation
+        # Get report format details
+        title, description, prompt = REPORT_FORMATS.get(
+            report_format,
+            (report_format, "", f"Write a {report_format} based on the source material.")
+        )
+        
+        # Build params
+        source_ids_triple = [[[sid]] for sid in source_ids]
+        source_ids_double = [[sid] for sid in source_ids]
+        
+        params = [
+            [2],
+            notebook_id,
+            [
+                None,  # [0]
+                None,  # [1]
+                STUDIO_TYPE_REPORT,  # [2]: type code = 2
+                source_ids_triple,   # [3]
+                None,  # [4]
+                None,  # [5]
+                None,  # [6]
+                [
+                    None,
+                    [
+                        title,
+                        description,
+                        None,
+                        source_ids_double,
+                        language,
+                        prompt,
+                        None,
+                        True,
+                    ],
+                ],  # [7]
+            ],
+        ]
+        
+        result = self._call_rpc(RPC_CREATE_STUDIO, params, f"/notebook/{notebook_id}")
+        
         latency = round(time.time() * 1000 - start_ms, 2)
         metrics = {"status": "success", "latency_ms": latency}
-        return {
-            "notebook_id": notebook_id,
-            "format": report_format,
-            "language": language,
-            "status": "created",
-        }, metrics
+        
+        if result and isinstance(result, list) and len(result) > 0:
+            ad = result[0]
+            aid = ad[0] if isinstance(ad, list) and len(ad) > 0 else None
+            return {"artifact_id": aid, "notebook_id": notebook_id, "type": "report", "format": report_format}, metrics
+        return {"artifact_id": None, "notebook_id": notebook_id, "type": "report", "format": report_format}, metrics
+
 
 
 # =============================================================================

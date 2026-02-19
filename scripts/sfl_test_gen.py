@@ -29,8 +29,8 @@ from typing import Any
 # LOGGING
 # =============================================================================
 _LEVELS = {"TRACE": 5, "DEBUG": 10, "INFO": 20, "WARN": 30, "ERROR": 40, "FATAL": 50}
-_THRESHOLD = _LEVELS.get(os.environ.get("SFA_LOG_LEVEL", "INFO"), 20)
-_LOG_DIR = os.environ.get("SFA_LOG_DIR", "")
+_THRESHOLD = _LEVELS.get(os.environ.get("SFB_LOG_LEVEL", "INFO"), 20)
+_LOG_DIR = os.environ.get("SFB_LOG_DIR", "")
 _SCRIPT = Path(__file__).stem
 _LOG = (
     Path(_LOG_DIR) / f"{_SCRIPT}_log.tsv"
@@ -445,7 +445,9 @@ def main():
     args = parser.parse_args()
 
     try:
-        if args.command == "generate":
+        if args.command == "mcp-stdio":
+            _run_mcp()
+        elif args.command == "generate":
             file_path = args.file
             if not file_path and not sys.stdin.isatty():
                 file_path = sys.stdin.read().strip()
@@ -460,9 +462,7 @@ def main():
             )
             print(result)
             _log("INFO", "generate", f"Test generation complete", detail=f"file={file_path}", metrics=str(metrics))
-            
-        elif args.command == "mcp-stdio":
-            _run_mcp()
+
         else:
             parser.print_help()
             

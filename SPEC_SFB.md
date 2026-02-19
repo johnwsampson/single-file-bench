@@ -269,7 +269,7 @@ Each section has a reason for its position. Configuration comes before functions
 The CONFIGURATION section is for deployment-fixed values that rarely change but must be easy to find when they do. It is NOT a dumping ground.
 
 - **CONFIG dict** for related settings: `CONFIG = {"request_timeout_seconds": 30.0, "max_results": 50}`
-- **Module constants** for standalone values: `SEARXNG_BASE = "http://192.168.10.75:8888"`
+- **Module constants** for standalone values: `SEARXNG_BASE = "http://localhost:8888"`
 - **Descriptive names with units** — always: `request_timeout_seconds`, `fetch_max_content_bytes`, `cache_ttl_seconds`. Never: `timeout`, `max_content`, `ttl`.
 - Infrastructure (HTTP clients, connection pools) belongs in CORE FUNCTIONS, not CONFIGURATION.
 
@@ -294,7 +294,7 @@ Every script declares its public capabilities in the CONFIGURATION section:
 # =============================================================================
 EXPOSED = ["search", "fetch", "engines"]  # CLI + MCP — both interfaces
 
-SEARXNG_BASE = "http://192.168.10.75:8888"
+SEARXNG_BASE = "http://localhost:8888"
 CONFIG = { ... }
 ```
 

@@ -30,8 +30,8 @@ from typing import Any
 # LOGGING
 # =============================================================================
 _LEVELS = {"TRACE": 5, "DEBUG": 10, "INFO": 20, "WARN": 30, "ERROR": 40, "FATAL": 50}
-_THRESHOLD = _LEVELS.get(os.environ.get("SFA_LOG_LEVEL", "INFO"), 20)
-_LOG_DIR = os.environ.get("SFA_LOG_DIR", "")
+_THRESHOLD = _LEVELS.get(os.environ.get("SFB_LOG_LEVEL", "INFO"), 20)
+_LOG_DIR = os.environ.get("SFB_LOG_DIR", "")
 _SCRIPT = Path(__file__).stem
 _LOG = (
     Path(_LOG_DIR) / f"{_SCRIPT}_log.tsv"
@@ -101,16 +101,21 @@ Your jq command:"""
 # =============================================================================
 def _jq_exec(jq_command: str, input_file: str) -> tuple[bool, str]:
     """Execute jq command on a file. Returns (success, output)."""
+    import shlex
     try:
-        # Replace INPUT_FILE placeholder if present
-        cmd = jq_command.replace("INPUT_FILE", input_file)
-        if input_file not in cmd and "INPUT_FILE" not in jq_command:
-            # Append file if not already in command
-            cmd = f"{cmd} {input_file}"
+        # Parse jq_command safely - it should be just the jq filter + flags
+        # Expected format: "jq '.filter'" or "jq -r '.filter'"
+        cmd_parts = shlex.split(jq_command)
+        
+        # Validate that first part is 'jq'
+        assert cmd_parts and cmd_parts[0] == "jq", f"Command must start with 'jq', got: {cmd_parts[0] if cmd_parts else 'empty'}"
+        
+        # Build safe argument list: jq [flags] 'filter' input_file
+        args = ["jq"] + cmd_parts[1:] + [input_file]
         
         result = subprocess.run(
-            cmd,
-            shell=True,
+            args,
+            shell=False,
             capture_output=True,
             text=True,
             timeout=30,
@@ -365,7 +370,9 @@ def main():
     args = parser.parse_args()
 
     try:
-        if args.command == "generate":
+        if args.command == "mcp-stdio":
+            _run_mcp()
+        elif args.command == "generate":
             cmd, metrics = _generate_impl(args.instruction, args.input_file)
             print(cmd)
             _log("INFO", "generate", f"Generated jq command", detail=f"file={args.input_file}", metrics=str(metrics))
@@ -379,9 +386,6 @@ def main():
             result, metrics = _query_impl(instruction, args.input_file, args.output, args.execute)
             print(result)
             _log("INFO", "query", f"Query completed", detail=f"file={args.input_file}", metrics=str(metrics))
-            
-        elif args.command == "mcp-stdio":
-            _run_mcp()
         else:
             parser.print_help()
             

@@ -91,8 +91,8 @@ def _log(level: str, event: str, msg: str, **kw):
 # CONFIGURATION
 # =============================================================================
 
-VERA_ROOT = Path(os.environ.get("VERA_ROOT", Path(__file__).parent.parent))
-BRAIN_DIR = VERA_ROOT / "brain"
+PROJECT_ROOT = Path(os.environ.get("PROJECT_ROOT", Path(__file__).parent.parent))
+BRAIN_DIR = PROJECT_ROOT / "brain"
 THOUGHTS_FILE = BRAIN_DIR / "thoughts.tsv"
 BRAIN_SCRIPT = Path(__file__).parent / "sft_brain.py"
 
@@ -677,7 +677,7 @@ def _promote_impl(
             capture_output=True,
             text=True,
             timeout=30,
-            cwd=str(VERA_ROOT),
+            cwd=str(PROJECT_ROOT),
         )
         if proc.returncode != 0:
             _log("ERROR", "promote_fail", proc.stderr[:200])

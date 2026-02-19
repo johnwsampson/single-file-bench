@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = ["fastmcp", "httpx", "youtube-transcript-api>=0.6.0", "yt-dlp"]
 # ///
-"""YouTube video operations - info, transcripts, channel search.
+"""YouTube video operations - info, transcripts, channel search, frame extraction.
 
 Usage:
     sfa_youtube_video.py info <url_or_id>
@@ -11,10 +11,12 @@ Usage:
     sfa_youtube_video.py channel_search <handle> <query> [--max-results N]
     sfa_youtube_video.py channel_info <handle>
     sfa_youtube_video.py channel_videos <handle> [--sort SORT] [--order ORDER] [--max-results N]
+    sfa_youtube_video.py view_frames <url_or_id> [--at M:SS,M:SS] [--threshold N] [--min-gap N]
     sfa_youtube_video.py mcp-stdio
 """
 
 import os
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -23,8 +25,8 @@ from pathlib import Path
 # =============================================================================
 _LEVELS = {"TRACE": 5, "DEBUG": 10, "INFO": 20, "WARN": 30, "ERROR": 40, "FATAL": 50}
 # Environment variables are external - defensive access appropriate
-_THRESHOLD = _LEVELS.get(os.environ.get("SFA_LOG_LEVEL", "INFO"), 20)
-_LOG_DIR = os.environ.get("SFA_LOG_DIR", "")
+_THRESHOLD = _LEVELS.get(os.environ.get("SFB_LOG_LEVEL", "INFO"), 20)
+_LOG_DIR = os.environ.get("SFB_LOG_DIR", "")
 _SCRIPT = Path(__file__).stem
 _LOG = Path(_LOG_DIR) / f"{_SCRIPT}_log.tsv" if _LOG_DIR else Path(__file__).parent / f"{_SCRIPT}_log.tsv"
 _HEADER = "#timestamp\tscript\tlevel\tevent\tmessage\tdetail\tmetrics\ttrace\n"
@@ -48,7 +50,7 @@ def _log(level: str, event: str, msg: str, *, detail: str = "", metrics: str = "
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
-EXPOSED = ["info", "transcript", "channel_search", "channel_info", "channel_videos"]
+EXPOSED = ["info", "transcript", "channel_search", "channel_info", "channel_videos", "view_frames"]
 
 CONFIG = {
     "default_language": "en",
@@ -463,6 +465,136 @@ def _channel_videos_impl(handle: str, sort: str = "time", order: str = "descendi
         return {"error": str(e)}, {"status": "error", "latency_ms": latency}
 
 
+def _view_frames_impl(
+    url: str,
+    timestamps: list[str] | None = None,
+    threshold: float = 0.3,
+    min_gap: float = 5.0,
+    output_dir: str = "",
+) -> tuple[dict, dict]:
+    """Extract key frames from a YouTube video via scene detection or specific timestamps.
+
+    Args:
+        url: YouTube URL or video ID
+        timestamps: Specific timestamps to extract (e.g. ["4:32", "12:15"]). If None, uses scene detection.
+        threshold: Scene change sensitivity 0.0-1.0 (default 0.3, higher = fewer frames)
+        min_gap: Minimum seconds between scene-detected frames (default 5.0)
+        output_dir: Output directory (default: data/youtube_frames/<video_id>)
+    """
+    import json
+    import shutil
+    import subprocess
+    import tempfile
+    import time
+
+    start_ms = time.time() * 1000
+    video_id = _extract_video_id(url)
+    _log("INFO", "view_frames_start", f"video={video_id}")
+
+    out_dir = Path(output_dir) if output_dir else Path("data/youtube_frames") / video_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Clean any existing frames
+    for old in out_dir.glob("frame_*.jpg"):
+        old.unlink()
+
+    try:
+        # Step 1: Download video
+        with tempfile.TemporaryDirectory() as tmp:
+            video_path = Path(tmp) / "video.mp4"
+            dl_cmd = [
+                "yt-dlp", "-f", "bestvideo[height<=720]",
+                "-o", str(video_path),
+                f"https://www.youtube.com/watch?v={video_id}",
+            ]
+            dl = subprocess.run(dl_cmd, capture_output=True, text=True, timeout=120)
+            assert dl.returncode == 0, f"yt-dlp failed: {dl.stderr[-500:]}"
+            assert video_path.exists(), "Downloaded video file not found"
+
+            if timestamps:
+                # Mode: extract specific timestamps
+                frames = []
+                for i, ts in enumerate(timestamps):
+                    parts = ts.strip().split(":")
+                    assert len(parts) in (2, 3), f"Invalid timestamp format: {ts} (use M:SS or H:MM:SS)"
+                    if len(parts) == 2:
+                        secs = int(parts[0]) * 60 + int(parts[1])
+                    else:
+                        secs = int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+                    mins = secs // 60
+                    s = secs % 60
+                    fname = f"frame_{i+1:02d}_{mins:02d}m{s:02d}s.jpg"
+                    fpath = out_dir / fname
+                    extract_cmd = [
+                        "ffmpeg", "-y", "-ss", str(secs),
+                        "-i", str(video_path),
+                        "-frames:v", "1", "-q:v", "2",
+                        str(fpath),
+                    ]
+                    r = subprocess.run(extract_cmd, capture_output=True, text=True, timeout=30)
+                    if r.returncode == 0 and fpath.exists():
+                        frames.append({"file": fname, "timestamp": ts, "seconds": secs})
+                    else:
+                        _log("WARN", "frame_extract_fail", f"ts={ts}: {r.stderr[-200:]}")
+
+            else:
+                # Mode: scene detection
+                # Single pass: extract frames + capture timestamps via showinfo
+                extract_cmd = [
+                    "ffmpeg", "-i", str(video_path),
+                    "-vf", f"select='gt(scene,{threshold})',showinfo",
+                    "-vsync", "vfr", "-q:v", "2",
+                    str(out_dir / "frame_%04d.jpg"),
+                ]
+                r = subprocess.run(extract_cmd, capture_output=True, text=True, timeout=300)
+
+                # Parse timestamps from showinfo in stderr
+                raw_times = []
+                for line in r.stderr.splitlines():
+                    if "pts_time:" in line:
+                        pts = line.split("pts_time:")[1].split()[0]
+                        raw_times.append(float(pts))
+
+                # Apply min_gap filter and rename
+                frames = []
+                kept_idx = 0
+                last_kept_time = -min_gap  # ensure first frame always passes
+                for i, secs in enumerate(raw_times):
+                    seq_file = out_dir / f"frame_{i+1:04d}.jpg"
+                    if not seq_file.exists():
+                        continue
+                    if secs - last_kept_time < min_gap:
+                        seq_file.unlink()
+                        continue
+                    last_kept_time = secs
+                    kept_idx += 1
+                    mins = int(secs) // 60
+                    s = int(secs) % 60
+                    fname = f"frame_{kept_idx:02d}_{mins:02d}m{s:02d}s.jpg"
+                    seq_file.rename(out_dir / fname)
+                    frames.append({"file": fname, "timestamp": f"{mins}:{s:02d}", "seconds": round(secs, 1)})
+
+        latency = round(time.time() * 1000 - start_ms, 2)
+        result = {
+            "video_id": video_id,
+            "mode": "timestamps" if timestamps else "scene_detect",
+            "output_dir": str(out_dir),
+            "frame_count": len(frames),
+            "frames": frames,
+        }
+        if not timestamps:
+            result["threshold"] = threshold
+            result["min_gap_seconds"] = min_gap
+        metrics = {"status": "success", "latency_ms": latency}
+        _log("INFO", "view_frames_done", f"video={video_id} frames={len(frames)}")
+        return result, metrics
+
+    except Exception as e:
+        latency = round(time.time() * 1000 - start_ms, 2)
+        _log("ERROR", "view_frames_error", str(e))
+        return {"error": str(e)}, {"status": "error", "latency_ms": latency}
+
+
 # =============================================================================
 # CLI INTERFACE
 # =============================================================================
@@ -505,6 +637,14 @@ def main():
     p_cvids.add_argument("-s", "--sort", default="time", choices=["time", "popular"], help="Sort field")
     p_cvids.add_argument("-o", "--order", default="descending", choices=["ascending", "descending"], help="Sort direction")
     p_cvids.add_argument("-n", "--max-results", type=int, default=10, help="Max results")
+    
+    # view_frames
+    p_vf = subparsers.add_parser("view_frames", help="Extract key frames from video")
+    p_vf.add_argument("url", nargs="?", help="YouTube URL or video ID")
+    p_vf.add_argument("-a", "--at", help="Specific timestamps (comma-separated, e.g. '4:32,12:15')")
+    p_vf.add_argument("-t", "--threshold", type=float, default=0.3, help="Scene detection sensitivity 0-1 (default 0.3)")
+    p_vf.add_argument("-g", "--min-gap", type=float, default=5.0, help="Min seconds between frames (default 5)")
+    p_vf.add_argument("-d", "--output-dir", default="", help="Output directory")
     
     args = parser.parse_args()
     
@@ -549,6 +689,14 @@ def main():
                 handle = sys.stdin.read().strip()
             assert handle, "handle required (positional argument or stdin)"
             result, metrics = _channel_videos_impl(handle, args.sort, args.order, args.max_results)
+            print(json.dumps({"result": result, "metrics": metrics}, indent=2))
+        elif args.command == "view_frames":
+            url = args.url
+            if not url and not sys.stdin.isatty():
+                url = sys.stdin.read().strip()
+            assert url, "url required (positional argument or stdin)"
+            timestamps = args.at.split(",") if args.at else None
+            result, metrics = _view_frames_impl(url, timestamps, args.threshold, args.min_gap, args.output_dir)
             print(json.dumps({"result": result, "metrics": metrics}, indent=2))
         else:
             parser.print_help()
@@ -627,6 +775,30 @@ def _run_mcp():
             max_results: Maximum number of results (default 10)
         """
         result, metrics = _channel_videos_impl(handle, sort, order, max_results)
+        return json.dumps({"result": result, "metrics": metrics})
+    
+    @mcp.tool()
+    def view_frames(
+        url: str,
+        timestamps: str = "",
+        threshold: float = 0.3,
+        min_gap: float = 5.0,
+        output_dir: str = "",
+    ) -> str:
+        """Extract key frames from a YouTube video via scene detection or specific timestamps.
+        
+        Default: scene detection extracts frames at visual transitions (slide changes, code switches).
+        Frames saved to data/youtube_frames/<video_id>/ with timestamped filenames.
+        
+        Args:
+            url: YouTube URL or video ID
+            timestamps: Comma-separated timestamps to extract (e.g. "4:32,12:15"). If empty, uses scene detection.
+            threshold: Scene detection sensitivity 0.0-1.0 (default 0.3, higher = fewer frames)
+            min_gap: Minimum seconds between scene-detected frames (default 5.0)
+            output_dir: Output directory (default: data/youtube_frames/<video_id>)
+        """
+        ts_list = [t.strip() for t in timestamps.split(",") if t.strip()] if timestamps else None
+        result, metrics = _view_frames_impl(url, ts_list, threshold, min_gap, output_dir)
         return json.dumps({"result": result, "metrics": metrics})
     
     print("ytv MCP server starting...", file=sys.stderr)

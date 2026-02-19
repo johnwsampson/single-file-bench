@@ -17,6 +17,8 @@ Usage:
     sft_recall.py mcp-stdio
 """
 
+import hashlib
+import hmac
 import json
 import os
 import pickle
@@ -58,9 +60,9 @@ def _log(level: str, event: str, msg: str, *, detail: str = "", metrics: str = "
 # =============================================================================
 EXPOSED = ["recall", "query"]
 
-VERA_ROOT = Path(os.environ.get("VERA_ROOT", Path(__file__).parent.parent))
-BRAIN_DIR = VERA_ROOT / "brain"
-CACHE_DIR = VERA_ROOT / ".cache"
+PROJECT_ROOT = Path(os.environ.get("PROJECT_ROOT", Path(__file__).parent.parent))
+BRAIN_DIR = PROJECT_ROOT / "brain"
+CACHE_DIR = PROJECT_ROOT / ".cache"
 BRAIN_PKL = CACHE_DIR / "brain.pkl"
 DB_PATH = CACHE_DIR / "brain.duckdb"
 
@@ -123,27 +125,51 @@ def _embed_query(text: str):
 
     key = _get_api_key()
     assert key, "OPENROUTER_API_KEY not found in env or scripts/.secrets"
-    resp = httpx.post(
-        OPENROUTER_URL,
-        headers={"Authorization": f"Bearer {key}"},
-        json={"model": EMBED_MODEL, "input": [text]},
-        timeout=30,
-    )
-    resp.raise_for_status()
+    try:
+        resp = httpx.post(
+            OPENROUTER_URL,
+            headers={"Authorization": f"Bearer {key}"},
+            json={"model": EMBED_MODEL, "input": [text]},
+            timeout=30,
+        )
+        resp.raise_for_status()
+    except httpx.HTTPStatusError as e:
+        _log("ERROR", "embed", f"Embedding API failed: {e.response.status_code}", detail=str(e))
+        raise RuntimeError(f"Embedding API error (HTTP {e.response.status_code})") from None
+    except httpx.RequestError as e:
+        _log("ERROR", "embed", f"Embedding request failed: {type(e).__name__}")
+        raise RuntimeError("Embedding API unreachable") from None
     return np.array(resp.json()["data"][0]["embedding"], dtype=np.float32)
 
 
 # ---- Semantic search (via brain.pkl embeddings) ----
 
+def _verify_brain_cache(data: bytes) -> bool:
+    """Verify HMAC-SHA256 signature of brain pickle cache (same scheme as sft_brain.py)."""
+    sig_path = BRAIN_PKL.with_suffix(".pkl.sig")
+    if not sig_path.exists():
+        return False
+    sig = sig_path.read_text().strip()
+    key = hashlib.sha256(str(BRAIN_PKL.absolute()).encode()).digest()
+    return hmac.compare_digest(hmac.new(key, data, hashlib.sha256).hexdigest(), sig)
+
+
+def _load_verified_cache() -> dict:
+    """Load brain pickle cache with HMAC verification."""
+    if not BRAIN_PKL.exists():
+        return {}
+    data = BRAIN_PKL.read_bytes()
+    assert _verify_brain_cache(data), "Brain cache signature invalid — run: brain build"
+    return pickle.loads(data)
+
+
 def _search_semantic(query_emb, limit: int) -> list[dict]:
     """Semantic search against brain pickle cache."""
     import numpy as np
 
-    if not BRAIN_PKL.exists():
+    cache = _load_verified_cache()
+    if not cache:
         return []
-
-    with open(BRAIN_PKL, "rb") as f:
-        cache = pickle.load(f)
 
     entries = cache.get("entries", [])
     embeddings = cache.get("embeddings")
@@ -176,11 +202,12 @@ def _search_semantic(query_emb, limit: int) -> list[dict]:
 
 def _search_keywords(terms: list[str], limit: int) -> list[dict]:
     """Keyword search against brain entries — catches terms semantic misses."""
-    if not BRAIN_PKL.exists() or not terms:
+    if not terms:
         return []
 
-    with open(BRAIN_PKL, "rb") as f:
-        cache = pickle.load(f)
+    cache = _load_verified_cache()
+    if not cache:
+        return []
 
     entries = cache.get("entries", [])
     if not entries:

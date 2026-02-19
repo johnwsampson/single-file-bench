@@ -29,6 +29,7 @@ Usage:
 
 import csv
 import hashlib
+import hmac
 import json
 import os
 import pickle
@@ -66,13 +67,34 @@ def _log(level: str, event: str, msg: str, *, detail: str = "", metrics: str = "
 
 
 # =============================================================================
+# INTEGRITY (HMAC signature for cache)
+# =============================================================================
+
+def _get_cache_key() -> bytes:
+    """Derive HMAC key from cache path."""
+    return hashlib.sha256(str(BRAIN_PKL.absolute()).encode()).digest()
+
+
+def _sign_cache(data: bytes) -> str:
+    """Compute HMAC-SHA256 signature for cache bytes."""
+    return hmac.new(_get_cache_key(), data, hashlib.sha256).hexdigest()
+
+
+def _verify_cache(data: bytes, signature: str) -> bool:
+    """Verify HMAC-SHA256 signature."""
+    return hmac.compare_digest(_sign_cache(data), signature)
+
+
+# =============================================================================
 # CONFIGURATION (no external config files)
 # =============================================================================
 EXPOSED = ["inscribe", "update", "delete", "factoid_set", "factoid_delete", "search", "semantic", "build", "stats"]
 
-VERA_ROOT = Path(os.environ.get("VERA_ROOT", Path(__file__).parent.parent))
-BRAIN_DIR = VERA_ROOT / "brain"
-CACHE_DIR = VERA_ROOT / ".cache"
+PROJECT_ROOT = Path(os.environ.get("PROJECT_ROOT", Path(__file__).parent.parent))
+BRAIN_DIR = PROJECT_ROOT / "brain"
+CONTEXT_DIR = PROJECT_ROOT / "context"
+REFERENCES_DIR = PROJECT_ROOT / "references"
+CACHE_DIR = PROJECT_ROOT / ".cache"
 BRAIN_PKL = CACHE_DIR / "brain.pkl"
 DB_PATH = CACHE_DIR / "brain.duckdb"
 
@@ -84,6 +106,7 @@ TABLES = {
     "aspiration": {"file": "aspirations.tsv", "cols": ["key", "aspiration", "type", "recorded"], "content_col": "aspiration", "meta_col": "type"},
 }
 VALID_TABLES = set(TABLES.keys())
+TSV_NAMES = {t["file"] for t in TABLES.values()} | {"links.tsv", "factoids.tsv", "catalog.tsv"}
 
 LINK_COLS = ["key", "from_table", "from_key", "to_table", "to_key"]
 FACTOID_COLS = ["key", "value", "updated"]
@@ -207,14 +230,69 @@ def _log_mutation(action: str, table: str, key: str, detail_text: str = ""):
         pass
 
 
+def _load_doc_entries() -> list[dict]:
+    """Load context/ and references/ markdown files as searchable entries.
+
+    Each file is chunked by ## sections. Each section becomes one entry
+    with _table="doc", key="filename#section-slug", _content=section text.
+    Files without ## headers become a single entry.
+    """
+    entries = []
+    for dir_path, doc_table in [(CONTEXT_DIR, "doc:context"), (REFERENCES_DIR, "doc:reference")]:
+        if not dir_path.is_dir():
+            continue
+        for md_file in sorted(dir_path.glob("*.md")):
+            if md_file.name == "chat_tail.md":
+                continue  # ephemeral, skip
+            content = md_file.read_text(errors="replace")
+            stem = md_file.stem
+            # Split by ## headers
+            sections = re.split(r'^(## .+)$', content, flags=re.MULTILINE)
+            if len(sections) <= 1:
+                # No ## headers — single entry for whole file
+                entries.append({
+                    "key": f"doc:{stem}",
+                    "_table": doc_table,
+                    "_content": content[:4000],
+                    "_path": str(md_file.relative_to(PROJECT_ROOT)),
+                    "_section": "",
+                })
+            else:
+                # First chunk before any ## header (title/preamble)
+                preamble = sections[0].strip()
+                if preamble:
+                    entries.append({
+                        "key": f"doc:{stem}",
+                        "_table": doc_table,
+                        "_content": preamble[:4000],
+                        "_path": str(md_file.relative_to(PROJECT_ROOT)),
+                        "_section": "preamble",
+                    })
+                # Pairs of (header, body)
+                for i in range(1, len(sections), 2):
+                    header = sections[i].strip()
+                    body = sections[i + 1].strip() if i + 1 < len(sections) else ""
+                    section_text = f"{header}\n{body}"
+                    slug = re.sub(r"[^a-z0-9]+", "-", header.lower().lstrip("# ")).strip("-")[:30]
+                    entries.append({
+                        "key": f"doc:{stem}#{slug}",
+                        "_table": doc_table,
+                        "_content": section_text[:4000],
+                        "_path": str(md_file.relative_to(PROJECT_ROOT)),
+                        "_section": header.lstrip("# "),
+                    })
+    return entries
+
+
 def _load_all_entries() -> list[dict]:
-    """Load all entries from all FOQA tables."""
+    """Load all entries from all FOQA tables plus context/reference docs."""
     entries = []
     for table in TABLES:
         for row in _read_table(table):
             row["_table"] = table
             row["_content"] = row.get(TABLES[table]["content_col"], "")
             entries.append(row)
+    entries.extend(_load_doc_entries())
     return entries
 
 
@@ -449,22 +527,22 @@ def _factoid_delete_impl(key: str) -> dict:
 # ---- Search operations ----
 
 def _search_impl(pattern: str, table: str = "", limit: int = 20) -> list[dict]:
-    """Regex search across FOQA entries and factoids.
+    """Regex search across FOQA entries, factoids, and context/reference docs.
 
     CLI: search
     MCP: search
 
     Args:
         pattern: Regex pattern to search for
-        table: Limit to specific table (empty for all, "factoid" for factoids only)
+        table: Limit to specific table (empty for all, "factoid" for factoids, "doc" for docs only)
         limit: Maximum results to return
     """
     assert pattern, "search pattern required"
     regex = re.compile(pattern, re.IGNORECASE)
     results = []
 
-    # Search FOQA tables (unless specifically asking for factoids only)
-    if table != "factoid":
+    # Search FOQA tables (unless specifically asking for factoids or docs only)
+    if table not in ("factoid", "doc"):
         search_tables = [table] if table and table in VALID_TABLES else list(TABLES.keys())
         for tbl in search_tables:
             tdef = TABLES[tbl]
@@ -492,6 +570,21 @@ def _search_impl(pattern: str, table: str = "", limit: int = 20) -> list[dict]:
                     "table": "factoid",
                     "content": row.get("value", "")[:200],
                     "meta": row.get("updated", ""),
+                })
+                if len(results) >= limit:
+                    _log("INFO", "search", f"Found {len(results)} results for '{pattern}'",
+                         detail=f"pattern={pattern} table={table or 'all'}")
+                    return results
+
+    # Search context/reference docs (when table is "doc" or searching all)
+    if table in ("doc", ""):
+        for entry in _load_doc_entries():
+            if regex.search(entry["_content"]) or regex.search(entry["key"]):
+                results.append({
+                    "key": entry["key"],
+                    "table": entry["_table"],
+                    "content": entry["_content"][:200],
+                    "meta": entry.get("_path", ""),
                 })
                 if len(results) >= limit:
                     _log("INFO", "search", f"Found {len(results)} results for '{pattern}'",
@@ -556,8 +649,18 @@ def _semantic_impl(query: str, limit: int = 10) -> list[dict]:
 def _load_cache() -> dict:
     """Load brain pickle cache."""
     if BRAIN_PKL.exists():
-        with open(BRAIN_PKL, "rb") as f:
-            return pickle.load(f)
+        try:
+            with open(BRAIN_PKL, "rb") as f:
+                data = f.read()
+            sig_path = BRAIN_PKL.with_suffix(".pkl.sig")
+            if sig_path.exists():
+                with open(sig_path, "r") as f:
+                    sig = f.read().strip()
+                if _verify_cache(data, sig):
+                    return pickle.loads(data)
+            _log("WARN", "cache", "Cache signature missing or invalid. Rebuilding...")
+        except Exception as e:
+            _log("ERROR", "cache", f"Failed to load cache: {e}")
     return {"entries": [], "embeddings": None, "built": None}
 
 
@@ -621,8 +724,11 @@ def _build_impl(embed: bool = True) -> dict:
 
     # Write pickle
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    data = pickle.dumps(cache)
     with open(BRAIN_PKL, "wb") as f:
-        pickle.dump(cache, f)
+        f.write(data)
+    with open(BRAIN_PKL.with_suffix(".pkl.sig"), "w") as f:
+        f.write(_sign_cache(data))
 
     # Build parquet + DuckDB
     _build_analytical_cache()
@@ -635,7 +741,7 @@ def _build_impl(embed: bool = True) -> dict:
 
 
 def _build_analytical_cache():
-    """Rebuild parquet and DuckDB from TSV source of truth."""
+    """Rebuild parquet and DuckDB from TSV source of truth + context/reference docs."""
     try:
         import duckdb
 
@@ -650,12 +756,35 @@ def _build_analytical_cache():
             tsv_path = BRAIN_DIR / f"{name}.tsv"
             if not tsv_path.exists():
                 continue
+            # Security: Validate path against whitelist before SQL interpolation
+            assert tsv_path.name in TSV_NAMES, f"Untrusted TSV file: {tsv_path.name}"
             db.execute(f"""
                 CREATE TABLE {name} AS
                 SELECT * FROM read_csv('{tsv_path}', delim='\t', header=true, auto_detect=true)
             """)
             parquet_path = CACHE_DIR / f"{name}.parquet"
             db.execute(f"COPY {name} TO '{parquet_path}' (FORMAT PARQUET)")
+
+        # Build docs table from context/ and references/ markdown files
+        doc_entries = _load_doc_entries()
+        if doc_entries:
+            db.execute("""
+                CREATE TABLE docs (
+                    key VARCHAR,
+                    table_name VARCHAR,
+                    path VARCHAR,
+                    section VARCHAR,
+                    content VARCHAR
+                )
+            """)
+            for entry in doc_entries:
+                db.execute(
+                    "INSERT INTO docs VALUES (?, ?, ?, ?, ?)",
+                    [entry["key"], entry["_table"], entry.get("_path", ""),
+                     entry.get("_section", ""), entry["_content"][:4000]]
+                )
+            parquet_path = CACHE_DIR / "docs.parquet"
+            db.execute(f"COPY docs TO '{parquet_path}' (FORMAT PARQUET)")
 
         db.close()
     except Exception as e:
@@ -682,6 +811,14 @@ def _stats_impl() -> dict:
         if path.exists():
             source_size_kb += path.stat().st_size / 1024
 
+    # Add context/reference doc sizes
+    doc_size_kb = 0
+    for dir_path in [CONTEXT_DIR, REFERENCES_DIR]:
+        if dir_path.is_dir():
+            for md_file in dir_path.glob("*.md"):
+                if md_file.name != "chat_tail.md":
+                    doc_size_kb += md_file.stat().st_size / 1024
+
     links_count = 0
     if LINKS_FILE.exists():
         links_count = sum(1 for _ in open(LINKS_FILE)) - 1
@@ -706,6 +843,7 @@ def _stats_impl() -> dict:
         "links": links_count,
         "factoids": factoids_count,
         "source_size_kb": round(source_size_kb, 1),
+        "doc_size_kb": round(doc_size_kb, 1),
         **cache_info,
     }
     _log("INFO", "stats", f"Brain stats: {len(entries)} entries", metrics=f"entries={len(entries)} links={links_count}")

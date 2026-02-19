@@ -39,8 +39,8 @@ from pathlib import Path
 # =============================================================================
 _LEVELS = {"TRACE": 5, "DEBUG": 10, "INFO": 20, "WARN": 30, "ERROR": 40, "FATAL": 50}
 # Environment variables are external - defensive access appropriate
-_THRESHOLD = _LEVELS.get(os.environ.get("SFA_LOG_LEVEL", "INFO"), 20)
-_LOG_DIR = os.environ.get("SFA_LOG_DIR", "")
+_THRESHOLD = _LEVELS.get(os.environ.get("SFB_LOG_LEVEL", "INFO"), 20)
+_LOG_DIR = os.environ.get("SFB_LOG_DIR", "")
 _SCRIPT = Path(__file__).stem
 _LOG = Path(_LOG_DIR) / f"{_SCRIPT}_log.tsv" if _LOG_DIR else Path(__file__).parent / f"{_SCRIPT}_log.tsv"
 _HEADER = "#timestamp\tscript\tlevel\tevent\tmessage\tdetail\tmetrics\ttrace\n"
@@ -106,7 +106,7 @@ _BROWSER_HTML = """<!DOCTYPE html>
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="mobile-web-app-capable" content="yes">
-    <title>Syne</title>
+    <title>TTS Server</title>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         html, body { height: 100%; overflow: hidden; }
@@ -202,7 +202,7 @@ _BROWSER_HTML = """<!DOCTYPE html>
 <body>
     <div class="header">
         <div class="header-top">
-            <span class="title">Syne</span>
+            <span class="title">TTS Server</span>
             <span id="status" class="status disconnected">Connecting...</span>
         </div>
         <div class="modes">
@@ -306,7 +306,7 @@ def _tmux_send(text: str) -> bool:
 VOICE_PRIME_PROMPT = (
     "You are receiving voice input from a human via speech-to-text. "
     "Input may contain transcription errors — interpret intent generously. "
-    "You are working in the SFA (Syne Function Arsenal) repository. "
+    "You are working in the SFA (SFB Tool Server) repository. "
     "Respond concisely. Execute commands when asked. "
     "If the input is ambiguous, ask for clarification briefly."
 )

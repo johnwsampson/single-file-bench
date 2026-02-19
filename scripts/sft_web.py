@@ -31,8 +31,8 @@ from bs4 import BeautifulSoup
 # LOGGING
 # =============================================================================
 _LEVELS = {"TRACE": 5, "DEBUG": 10, "INFO": 20, "WARN": 30, "ERROR": 40, "FATAL": 50}
-_THRESHOLD = _LEVELS.get(os.environ.get("SFA_LOG_LEVEL", "INFO"), 20)
-_LOG_DIR = os.environ.get("SFA_LOG_DIR", "")
+_THRESHOLD = _LEVELS.get(os.environ.get("SFB_LOG_LEVEL", "INFO"), 20)
+_LOG_DIR = os.environ.get("SFB_LOG_DIR", "")
 _SCRIPT = Path(__file__).stem
 _LOG = (
     Path(_LOG_DIR) / f"{_SCRIPT}_log.tsv"
@@ -70,7 +70,7 @@ def _log(
 # =============================================================================
 EXPOSED = ["search", "fetch", "engines"]  # CLI + MCP — both interfaces
 
-SEARXNG_BASE = "http://192.168.10.75:8888"
+SEARXNG_BASE = "http://localhost:8888"
 
 SEARCH_TIMEOUT = httpx.Timeout(connect=5.0, read=30.0, write=5.0, pool=5.0)
 FETCH_TIMEOUT = httpx.Timeout(connect=5.0, read=20.0, write=5.0, pool=5.0)
@@ -115,7 +115,7 @@ def _assert_fetchable_url(url: str):
     )
     assert parsed.hostname, "URL has a hostname"
     # Our SearXNG instance is always reachable
-    if parsed.hostname == "192.168.10.75":
+    if parsed.hostname == "localhost":
         return
     # Resolve hostname and verify the address is public
     try:
@@ -319,11 +319,22 @@ def engines_impl(category: str = None, enabled_only: bool = True) -> tuple[dict,
     }
 
 
-def fetch_impl(url: str) -> tuple[dict, dict]:
-    """Fetch URL to markdown. Validates input, asserts invariants, raises on failure."""
-    _assert_fetchable_url(url)
+FETCH_FORMATS = {"markdown", "text", "html"}
 
-    _log("INFO", "fetch_start", f"url={url}")
+
+def fetch_impl(url: str, format: str = "markdown") -> tuple[dict, dict]:
+    """Fetch URL and return content in requested format. Validates input, asserts invariants, raises on failure.
+
+    Args:
+        url: The URL to fetch content from
+        format: Output format — "markdown" (default), "text", or "html"
+    """
+    _assert_fetchable_url(url)
+    assert format in FETCH_FORMATS, (
+        f"format is one of {sorted(FETCH_FORMATS)} (got {format!r})"
+    )
+
+    _log("INFO", "fetch_start", f"url={url} format={format}")
     start = time.monotonic()
     client = _get_client()
     headers = {"User-Agent": CONFIG["fetch_user_agent"]}
@@ -369,19 +380,25 @@ def fetch_impl(url: str) -> tuple[dict, dict]:
     if soup.title and soup.title.string:
         title = soup.title.string.strip()
 
-    h = html2text.HTML2Text()
-    h.ignore_links = False
-    h.ignore_images = True
-    h.body_width = 0
-    markdown = h.handle(str(soup))
+    if format == "html":
+        out = str(soup).strip()
+    elif format == "text":
+        out = soup.get_text(separator="\n", strip=True)
+    else:
+        h = html2text.HTML2Text()
+        h.ignore_links = False
+        h.ignore_images = True
+        h.body_width = 0
+        out = h.handle(str(soup)).strip()
 
     latency_ms = (time.monotonic() - start) * 1000
-    _log("INFO", "fetch_complete", f"chars={len(markdown)}", detail=f"url={url}")
+    _log("INFO", "fetch_complete", f"chars={len(out)}", detail=f"url={url} format={format}")
     return (
-        {"url": url, "title": title, "content": markdown.strip()},
+        {"url": url, "title": title, "content": out, "format": format},
         {
             "latency_ms": round(latency_ms, 2),
-            "chars": len(markdown),
+            "chars": len(out),
+            "format": format,
             "status": "success",
         },
     )
@@ -444,9 +461,13 @@ def main():
     )
 
     # fetch
-    p_fetch = subparsers.add_parser("fetch", help="Fetch URL to markdown")
+    p_fetch = subparsers.add_parser("fetch", help="Fetch URL content")
     p_fetch.add_argument(
         "url", nargs="?", help="URL to fetch (or pipe via stdin, one per line)"
+    )
+    p_fetch.add_argument(
+        "-f", "--format", default="markdown", choices=sorted(FETCH_FORMATS),
+        help="Output format (default: markdown)"
     )
 
     args = parser.parse_args()
@@ -508,7 +529,7 @@ def main():
                 urls = [line.strip() for line in sys.stdin if line.strip()]
             assert urls, "url required (positional argument or stdin, one per line)"
             for url in urls:
-                result, metrics = fetch_impl(url)
+                result, metrics = fetch_impl(url, format=args.format)
                 print(
                     f"# {result['title']}\n\nSource: {result['url']}\n\n{result['content']}"
                 )
@@ -585,15 +606,16 @@ def _run_mcp():
         return json.dumps({"data": result, "metrics": metrics}, indent=2)
 
     @mcp.tool()
-    def fetch(url: str) -> str:
+    def fetch(url: str, format: str = "markdown") -> str:
         """Fetch webpage and convert to clean Markdown.
 
         Removes scripts, styles, nav, footer. Returns readable content.
 
         Args:
             url: The URL to fetch content from
+            format: Output format — "markdown" (default), "text", or "html"
         """
-        result, metrics = fetch_impl(url)
+        result, metrics = fetch_impl(url, format=format)
         return f"# {result['title']}\n\nSource: {result['url']}\n\n{result['content']}"
 
     print("web MCP server starting...", file=sys.stderr)

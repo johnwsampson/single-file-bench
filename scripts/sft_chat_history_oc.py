@@ -7,7 +7,7 @@
 
 Reads OpenCode's SQLite database to reconstruct conversation history.
 Scoped to the current project directory (detected from cwd).
-Primary use case: get the tail of the previous or current session so Vera
+Primary use case: get the tail of the previous or current session so the assistant
 can pick up context after startup or compaction.
 
 Data source:

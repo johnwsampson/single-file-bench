@@ -8,11 +8,11 @@
 # ]
 # ///
 """
-Syne Google OAuth - Headless authorization for Google APIs
+Google OAuth - Headless authorization for Google APIs
 
 Setup (one-time):
 1. Go to https://console.cloud.google.com/apis/credentials
-2. Create project if needed, name it "Syne"
+2. Create project if needed, name it "MyProject"
 3. Configure OAuth consent screen (External, just your email as test user)
 4. Create OAuth 2.0 Client ID (Desktop app type)
 5. Download JSON, save as persona/.google_credentials.json
@@ -55,7 +55,7 @@ def setup_oauth():
         print(f"ERROR: {CREDS_FILE} not found")
         print("\nSetup instructions:")
         print("1. Go to https://console.cloud.google.com/apis/credentials")
-        print("2. Create/select project named 'Syne'")
+        print("2. Create/select project named 'MyProject'")
         print(
             "3. Configure OAuth consent screen (External, add your email as test user)"
         )
@@ -283,7 +283,7 @@ def test_all():
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Syne Google OAuth")
+    parser = argparse.ArgumentParser(description="Google OAuth")
     parser.add_argument("--setup", action="store_true", help="One-time OAuth setup")
     parser.add_argument("--test", action="store_true", help="Test all APIs")
     parser.add_argument("--calendar", action="store_true", help="List calendar events")

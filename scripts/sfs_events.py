@@ -23,11 +23,13 @@ Usage:
     sfs_events.py agent-list [-s SOCKET]
     sfs_events.py agent-send -A AGENT -p PAYLOAD [-s SOCKET]
     sfs_events.py agent-retire -A AGENT [-s SOCKET]
+    sfs_events.py dashboard [static|serve] [-n] [-p PORT] [-s SOCKET]
     sfs_events.py mcp-stdio
 """
 
 import argparse
 import asyncio
+import ast
 import json
 import os
 import signal
@@ -38,15 +40,16 @@ import uuid
 from datetime import datetime, timezone
 from fnmatch import fnmatch
 from pathlib import Path
+import html as _html_mod
 
 # =============================================================================
 # LOGGING (TSV format — SPEC_SFB Principle 6)
 # =============================================================================
 _LEVELS = {"TRACE": 5, "DEBUG": 10, "INFO": 20, "WARN": 30, "ERROR": 40, "FATAL": 50}
 _THRESHOLD = _LEVELS.get(
-    os.environ.get("SFB_LOG_LEVEL", os.environ.get("SFA_LOG_LEVEL", "INFO")), 20
+    os.environ.get("SFB_LOG_LEVEL", os.environ.get("SFB_LOG_LEVEL", "INFO")), 20
 )
-_LOG_DIR = os.environ.get("SFB_LOG_DIR", os.environ.get("SFA_LOG_DIR", ""))
+_LOG_DIR = os.environ.get("SFB_LOG_DIR", os.environ.get("SFB_LOG_DIR", ""))
 _SCRIPT = Path(__file__).stem
 _LOG = (
     Path(_LOG_DIR) / f"{_SCRIPT}_log.tsv"
@@ -98,6 +101,13 @@ EXPOSED = [
     "agent-list",
     "agent-send",
     "agent-retire",
+    "dashboard",
+    "stage",
+    "staged",
+    "refine",
+    "release",
+    "pull",
+    "drop",
 ]
 
 SANCTUM_DIR = Path.home() / ".sanctum"
@@ -107,6 +117,12 @@ AUDIT_DIR = SANCTUM_DIR / "audit"
 AUDIT_FILE = AUDIT_DIR / "events.jsonl"
 
 TRIGGERS_FILE = SANCTUM_DIR / "triggers.jsonl"
+QUEUE_DIR = SANCTUM_DIR / "bus-queues"
+
+STAGING_FILE = Path(__file__).resolve().parent.parent / "data" / "staging.jsonl"
+_VALID_PRIORITIES = ("critical", "high", "medium", "low")
+_VALID_TARGETS = ("review", "fix", "docs", "research")
+_PRIORITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
 
 CONFIG = {
     "version": "0.3.0",
@@ -370,11 +386,17 @@ async def _deliver_message(msg: dict) -> int:
 
     # Deliver to socket subscribers
     delivered = 0
-    for cid, c in _clients.items():
+    for cid, c in list(_clients.items()):
         for pattern in c["subscriptions"]:
             if _channel_matches(pattern, channel):
-                await _write_frame(c["writer"], {"event": "message", "message": msg})
-                delivered += 1
+                try:
+                    await _write_frame(c["writer"], {"event": "message", "message": msg})
+                    delivered += 1
+                except Exception as e:
+                    _log(
+                        "WARN", "delivery_failed",
+                        f"client={cid} channel={channel}: {e}",
+                    )
                 break
 
     # Deliver to agent queues
@@ -385,8 +407,17 @@ async def _deliver_message(msg: dict) -> int:
             if _channel_matches(pattern, channel):
                 queue = _agent_queues.get(aid)
                 if queue:
-                    await queue.put(msg)
-                    delivered += 1
+                    if agent.get("config", {}).get("durable"):
+                        _durable_enqueue(aid, msg)
+                    try:
+                        queue.put_nowait(msg)
+                        delivered += 1
+                    except asyncio.QueueFull:
+                        aname = agent.get("name", aid)
+                        _log(
+                            "ERROR", "agent_queue_full",
+                            f"agent={aname} qsize={queue.qsize()} — message dropped",
+                        )
                 break
 
     # Audit
@@ -395,9 +426,13 @@ async def _deliver_message(msg: dict) -> int:
     return delivered
 
 
-async def _internal_publish(channel: str, payload: dict, source: str) -> dict:
+async def _internal_publish(
+    channel: str, payload: dict, source: str, correlation_id: str = ""
+) -> dict:
     """Publish a message from an internal source (trigger/agent). Returns the message."""
-    msg = _make_message(channel=channel, payload=payload, source=source)
+    msg = _make_message(
+        channel=channel, payload=payload, source=source, correlation_id=correlation_id
+    )
     await _deliver_message(msg)
     return msg
 
@@ -532,12 +567,48 @@ async def _url_trigger_run(trigger_id: str, config: dict, channel: str) -> None:
 
 
 # Register built-in trigger types
+async def _schedule_trigger_run(
+    trigger_id: str, config: dict, channel: str
+) -> None:
+    """Schedule trigger — publishes a tick message at fixed intervals."""
+    interval = config.get("interval_seconds", 300)
+    label = config.get("label", "tick")
+    assert interval >= 10, f"interval_seconds >= 10 (got {interval})"
+
+    try:
+        _log(
+            "INFO",
+            "trigger_start",
+            f"schedule trigger {trigger_id} every {interval}s label={label}",
+        )
+        while True:
+            await asyncio.sleep(interval)
+            await _internal_publish(
+                channel,
+                {
+                    "trigger_id": trigger_id,
+                    "event": "schedule",
+                    "label": label,
+                    "timestamp": datetime.now(timezone.utc).isoformat(
+                        timespec="milliseconds"
+                    ),
+                },
+                source=f"trigger:{trigger_id}",
+            )
+    except asyncio.CancelledError:
+        pass
+    finally:
+        _log("INFO", "trigger_stop", f"schedule trigger {trigger_id} stopped")
+
+
 TRIGGER_TYPES["file"] = "file"
 TRIGGER_TYPES["url"] = "url"
+TRIGGER_TYPES["schedule"] = "schedule"
 
 _TRIGGER_RUNNERS = {
     "file": _file_trigger_run,
     "url": _url_trigger_run,
+    "schedule": _schedule_trigger_run,
 }
 
 
@@ -603,6 +674,74 @@ _agent_tasks: dict[str, asyncio.Task] = {}  # agent_id → asyncio.Task
 _agent_queues: dict[str, asyncio.Queue] = {}  # agent_id → message queue
 
 
+# =============================================================================
+# CORE — Durable Agent Queues
+# =============================================================================
+
+
+def _durable_enqueue(agent_id: str, msg: dict) -> None:
+    """Append message to durable queue file. Called before in-memory enqueue."""
+    try:
+        QUEUE_DIR.mkdir(parents=True, exist_ok=True)
+        with open(QUEUE_DIR / f"{agent_id}.jsonl", "a") as f:
+            f.write(json.dumps({"type": "msg", "msg": msg}) + "\n")
+    except Exception as e:
+        _log("ERROR", "durable_enqueue_fail", f"agent={agent_id}: {e}")
+
+
+def _durable_ack(agent_id: str, msg_id: str) -> None:
+    """Mark message as processed in durable queue."""
+    queue_file = QUEUE_DIR / f"{agent_id}.jsonl"
+    if not queue_file.exists():
+        return
+    try:
+        with open(queue_file, "a") as f:
+            f.write(json.dumps({"type": "ack", "msg_id": msg_id}) + "\n")
+    except Exception as e:
+        _log("ERROR", "durable_ack_fail", f"agent={agent_id} msg={msg_id}: {e}")
+
+
+def _durable_replay(agent_id: str) -> list[dict]:
+    """Return unacked messages and compact the queue file."""
+    queue_file = QUEUE_DIR / f"{agent_id}.jsonl"
+    if not queue_file.exists():
+        return []
+
+    messages: dict[str, dict] = {}  # msg_id → msg (preserves order)
+    acked: set[str] = set()
+
+    try:
+        with open(queue_file) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                entry = json.loads(line)
+                if entry["type"] == "msg":
+                    msg = entry["msg"]
+                    messages[msg["id"]] = msg
+                elif entry["type"] == "ack":
+                    acked.add(entry["msg_id"])
+    except Exception as e:
+        _log("ERROR", "durable_replay_read_fail", f"agent={agent_id}: {e}")
+        return []
+
+    unacked = [msg for mid, msg in messages.items() if mid not in acked]
+
+    # Compact: rewrite with only unacked messages
+    try:
+        if unacked:
+            with open(queue_file, "w") as f:
+                for msg in unacked:
+                    f.write(json.dumps({"type": "msg", "msg": msg}) + "\n")
+        else:
+            queue_file.unlink(missing_ok=True)
+    except Exception as e:
+        _log("ERROR", "durable_compact_fail", f"agent={agent_id}: {e}")
+
+    return unacked
+
+
 def _save_agents() -> None:
     """Persist agent definitions to JSONL (survives restart)."""
     try:
@@ -653,44 +792,110 @@ async def _subprocess_agent_run(
     try:
         while True:
             msg = await queue.get()
-            try:
-                proc = await asyncio.create_subprocess_exec(
-                    *shlex.split(command),
-                    stdin=asyncio.subprocess.PIPE,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                stdout, stderr = await asyncio.wait_for(
-                    proc.communicate(json.dumps(msg).encode("utf-8")),
-                    timeout=timeout_s,
-                )
+            max_retries = agent_def["config"].get("timeout_retries", 0)
+            backoff = agent_def["config"].get("retry_backoff_seconds", 5.0)
+            inbound_cid = msg.get("correlation_id", "")
 
-                agent_def["messages_processed"] = (
-                    agent_def.get("messages_processed", 0) + 1
-                )
-
-                if stderr.strip():
-                    _log(
-                        "WARN",
-                        "agent_stderr",
-                        f"agent={agent_id}: {stderr.decode()[:200]}",
+            for attempt in range(max_retries + 1):
+                try:
+                    proc = await asyncio.create_subprocess_exec(
+                        *shlex.split(command),
+                        stdin=asyncio.subprocess.PIPE,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    stdout, stderr = await asyncio.wait_for(
+                        proc.communicate(json.dumps(msg).encode("utf-8")),
+                        timeout=timeout_s,
                     )
 
-                # Publish stdout as response if configured
-                if publish_to and stdout.strip():
-                    out_channel = _resolve_channel(publish_to, project)
+                    agent_def["messages_processed"] = (
+                        agent_def.get("messages_processed", 0) + 1
+                    )
+
+                    # Ack durable queue after successful processing
+                    if agent_def.get("config", {}).get("durable"):
+                        _durable_ack(agent_id, msg.get("id", ""))
+
+                    if stderr.strip():
+                        _log(
+                            "WARN",
+                            "agent_stderr",
+                            f"agent={agent_id}: {stderr.decode()[:200]}",
+                        )
+
+                    # Publish stdout as response if configured
+                    if publish_to and stdout.strip():
+                        out_channel = _resolve_channel(publish_to, project)
+                        try:
+                            result_payload = json.loads(stdout)
+                        except json.JSONDecodeError:
+                            result_payload = {"output": stdout.decode("utf-8").strip()}
+                        await _internal_publish(
+                            out_channel, result_payload, source=f"agent:{agent_id}",
+                            correlation_id=inbound_cid,
+                        )
+                    break  # Success — exit retry loop
+
+                except asyncio.TimeoutError:
+                    # Kill the timed-out process
                     try:
-                        result_payload = json.loads(stdout)
-                    except json.JSONDecodeError:
-                        result_payload = {"output": stdout.decode("utf-8").strip()}
+                        proc.kill()
+                        await proc.wait()
+                    except Exception:
+                        pass
+
+                    if attempt < max_retries:
+                        delay = backoff * (2 ** attempt)
+                        _log(
+                            "WARN", "agent_retry",
+                            f"agent={agent_id} attempt={attempt + 1}/{max_retries + 1}"
+                            f" delay={delay}s",
+                        )
+                        await asyncio.sleep(delay)
+                        continue
+
+                    # All retries exhausted — publish failure event
+                    _log(
+                        "ERROR", "agent_timeout_exhausted",
+                        f"agent={agent_id} attempts={max_retries + 1}",
+                    )
                     await _internal_publish(
-                        out_channel, result_payload, source=f"agent:{agent_id}"
+                        _resolve_channel("agents:failed", project),
+                        {
+                            "agent_id": agent_id,
+                            "agent_name": agent_def.get("name", ""),
+                            "reason": "timeout_exhausted",
+                            "attempts": max_retries + 1,
+                            "timeout_seconds": timeout_s,
+                            "message_id": msg.get("id", ""),
+                            "message_channel": msg.get("channel", ""),
+                        },
+                        source=f"agent:{agent_id}",
+                        correlation_id=inbound_cid,
                     )
 
-            except asyncio.TimeoutError:
-                _log("WARN", "agent_timeout", f"agent={agent_id} timeout={timeout_s}s")
-            except Exception as e:
-                _log("ERROR", "agent_process_error", f"agent={agent_id}: {e}")
+                    # Dead-letter queue — preserve the original message
+                    orig_ch = msg.get("channel", "")
+                    dlq_ch = (
+                        orig_ch.replace("-tasks", "-dlq")
+                        if "-tasks" in orig_ch
+                        else f"dlq:{agent_def.get('name', 'unknown')}"
+                    )
+                    await _internal_publish(
+                        dlq_ch,
+                        {
+                            "reason": "timeout_exhausted",
+                            "attempts": max_retries + 1,
+                            "original_message": msg,
+                        },
+                        source=f"agent:{agent_id}",
+                        correlation_id=inbound_cid,
+                    )
+
+                except Exception as e:
+                    _log("ERROR", "agent_process_error", f"agent={agent_id}: {e}")
+                    break  # Non-timeout errors are not retried
     except asyncio.CancelledError:
         pass
     finally:
@@ -713,7 +918,8 @@ async def _start_agent(agent_id: str, agent_def: dict) -> bool:
         _log("ERROR", "agent_unknown_type", f"type={atype}, id={agent_id}")
         return False
 
-    queue: asyncio.Queue = asyncio.Queue()
+    max_q = agent_def.get("config", {}).get("max_queue_size", 50)
+    queue: asyncio.Queue = asyncio.Queue(maxsize=max_q)
     _agent_queues[agent_id] = queue
 
     task = asyncio.create_task(runner(agent_id, agent_def, queue))
@@ -752,6 +958,21 @@ async def _restore_agents() -> int:
             started += 1
     if started:
         _log("INFO", "agents_restored", f"count={started}")
+
+    # Replay durable queues for agents with durable=true
+    for aid, d in _agents.items():
+        if d.get("config", {}).get("durable") and d.get("status") == "running":
+            unacked = _durable_replay(aid)
+            if unacked:
+                queue = _agent_queues.get(aid)
+                if queue:
+                    for m in unacked:
+                        await queue.put(m)
+                    _log(
+                        "INFO", "durable_replay",
+                        f"agent={aid} name={d.get('name', '?')} replayed={len(unacked)}",
+                    )
+
     return started
 
 
@@ -1340,10 +1561,11 @@ def _trigger_add_impl(
     """Add a trigger to the bus. CLI: trigger-add, MCP: trigger_add.
 
     Args:
-        trigger_type: Trigger type — "file" or "url"
+        trigger_type: Trigger type — "file", "url", or "schedule"
         channel: Channel to publish events to (auto-scoped to project)
         config: JSON config string — file: {path, recursive, events, debounce_seconds}
                                     — url: {url, interval_seconds}
+                                    — schedule: {interval_seconds, label}
     """
     start_ms = time.time() * 1000
     try:
@@ -1512,6 +1734,1953 @@ def _agent_retire_impl(
 
 
 # =============================================================================
+# STAGING — Task Queue (append-only JSONL)
+# =============================================================================
+
+
+def _staging_read_all() -> list[dict]:
+    """Read all lines from staging.jsonl."""
+    if not STAGING_FILE.exists():
+        return []
+    entries: list[dict] = []
+    with open(STAGING_FILE) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entries.append(json.loads(line))
+            except (json.JSONDecodeError, TypeError):
+                continue
+    return entries
+
+
+def _staging_current() -> list[dict]:
+    """Get current state of all tasks (last snapshot per ID)."""
+    all_entries = _staging_read_all()
+    latest: dict[str, dict] = {}
+    for entry in all_entries:
+        task_id = entry.get("id", "")
+        if task_id:
+            latest[task_id] = entry
+    return list(latest.values())
+
+
+def _staging_active() -> list[dict]:
+    """Get only staged tasks, sorted by priority then age."""
+    current = _staging_current()
+    active = [t for t in current if t.get("status") == "staged"]
+    active.sort(
+        key=lambda t: (
+            _PRIORITY_ORDER.get(t.get("priority", "medium"), 2),
+            t.get("created", ""),
+        )
+    )
+    return active
+
+
+def _staging_append(entry: dict) -> None:
+    """Append a staging entry to the JSONL file."""
+    STAGING_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(STAGING_FILE, "a") as f:
+        f.write(json.dumps(entry, default=str) + "\n")
+
+
+# -- Staging _impl functions --------------------------------------------------
+
+
+def _stage_impl(
+    title: str,
+    description: str = "",
+    priority: str = "medium",
+    target: str = "fix",
+) -> tuple[dict, dict]:
+    """Stage a new task for team execution. CLI: stage, MCP: stage."""
+    start_ms = time.time() * 1000
+    assert title.strip(), "Title is required"
+    assert priority in _VALID_PRIORITIES, f"Invalid priority: {priority}. Must be one of {_VALID_PRIORITIES}"
+    assert target in _VALID_TARGETS, f"Invalid target: {target}. Must be one of {_VALID_TARGETS}"
+
+    now = datetime.now(timezone.utc).isoformat()
+    task_id = uuid.uuid4().hex[:8]
+    entry = {
+        "id": task_id,
+        "status": "staged",
+        "title": title.strip(),
+        "description": description.strip(),
+        "priority": priority,
+        "target": target,
+        "created": now,
+        "updated": now,
+        "correlation_id": "",
+    }
+    _staging_append(entry)
+    _log("INFO", "stage", f"id={task_id} title={title[:60]} target={target} priority={priority}")
+
+    latency_ms = time.time() * 1000 - start_ms
+    return entry, {"status": "success", "action": "staged", "latency_ms": round(latency_ms, 2)}
+
+
+def _staged_impl(
+    include_released: bool = False,
+) -> tuple[list[dict], dict]:
+    """List staged tasks sorted by priority. CLI: staged, MCP: staged."""
+    start_ms = time.time() * 1000
+
+    if include_released:
+        current = _staging_current()
+        tasks = [t for t in current if t.get("status") in ("staged", "released", "pulled")]
+        tasks.sort(
+            key=lambda t: (
+                0 if t["status"] == "staged" else 1,
+                _PRIORITY_ORDER.get(t.get("priority", "medium"), 2),
+                t.get("created", ""),
+            )
+        )
+    else:
+        tasks = _staging_active()
+
+    latency_ms = time.time() * 1000 - start_ms
+    return tasks, {"status": "success", "count": len(tasks), "latency_ms": round(latency_ms, 2)}
+
+
+def _refine_impl(
+    task_id: str,
+    title: str = "",
+    description: str = "",
+    priority: str = "",
+    target: str = "",
+) -> tuple[dict, dict]:
+    """Refine a staged task. CLI: refine, MCP: refine."""
+    start_ms = time.time() * 1000
+    assert task_id.strip(), "Task ID is required"
+    if priority:
+        assert priority in _VALID_PRIORITIES, f"Invalid priority: {priority}"
+    if target:
+        assert target in _VALID_TARGETS, f"Invalid target: {target}"
+
+    current = _staging_current()
+    task = next((t for t in current if t["id"] == task_id), None)
+    assert task is not None, f"Task {task_id} not found"
+    assert task["status"] == "staged", f"Can only refine staged tasks (current status: {task['status']})"
+
+    updated = dict(task)
+    if title.strip():
+        updated["title"] = title.strip()
+    if description.strip():
+        updated["description"] = description.strip()
+    if priority:
+        updated["priority"] = priority
+    if target:
+        updated["target"] = target
+    updated["updated"] = datetime.now(timezone.utc).isoformat()
+
+    _staging_append(updated)
+    _log("INFO", "refine", f"id={task_id}")
+
+    latency_ms = time.time() * 1000 - start_ms
+    return updated, {"status": "success", "action": "refined", "latency_ms": round(latency_ms, 2)}
+
+
+def _release_impl(
+    task_id: str,
+    *,
+    socket_path: str = DEFAULT_SOCKET,
+) -> tuple[dict, dict]:
+    """Release a staged task to its target coordinator. CLI: release, MCP: release."""
+    start_ms = time.time() * 1000
+    assert task_id.strip(), "Task ID is required"
+
+    current = _staging_current()
+    task = next((t for t in current if t["id"] == task_id), None)
+    assert task is not None, f"Task {task_id} not found"
+    assert task["status"] == "staged", f"Can only release staged tasks (current status: {task['status']})"
+
+    correlation_id = f"staging-{task_id}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}"
+    target = task["target"]
+    channel = f"coord:{target}-tasks"
+
+    payload = {
+        "title": task["title"],
+        "prompt": task["description"],
+        "source": "staging",
+        "correlation_id": correlation_id,
+    }
+
+    pub_result = _bus_request(
+        {
+            "cmd": "publish",
+            "channel": channel,
+            "payload": payload,
+            "source": "staging",
+            "correlation_id": correlation_id,
+        },
+        socket_path,
+    )
+
+    released = dict(task)
+    released["status"] = "released"
+    released["correlation_id"] = correlation_id
+    released["updated"] = datetime.now(timezone.utc).isoformat()
+    _staging_append(released)
+
+    _log("INFO", "release", f"id={task_id} target={target} correlation_id={correlation_id}")
+
+    latency_ms = time.time() * 1000 - start_ms
+    result = {
+        "task": released,
+        "published_to": channel,
+        "correlation_id": correlation_id,
+        "delivery": pub_result.get("delivery", 0),
+    }
+    return result, {"status": "success", "action": "released", "latency_ms": round(latency_ms, 2)}
+
+
+def _pull_impl(task_id: str) -> tuple[dict, dict]:
+    """Pull a staged task for direct work (exception path). CLI: pull, MCP: pull."""
+    start_ms = time.time() * 1000
+    assert task_id.strip(), "Task ID is required"
+
+    current = _staging_current()
+    task = next((t for t in current if t["id"] == task_id), None)
+    assert task is not None, f"Task {task_id} not found"
+    assert task["status"] == "staged", f"Can only pull staged tasks (current status: {task['status']})"
+
+    pulled = dict(task)
+    pulled["status"] = "pulled"
+    pulled["updated"] = datetime.now(timezone.utc).isoformat()
+    _staging_append(pulled)
+
+    _log("INFO", "pull", f"id={task_id} title={task['title'][:60]}")
+
+    latency_ms = time.time() * 1000 - start_ms
+    return pulled, {"status": "success", "action": "pulled", "latency_ms": round(latency_ms, 2)}
+
+
+def _drop_impl(task_id: str) -> tuple[dict, dict]:
+    """Drop (cancel) a staged task. CLI: drop, MCP: drop."""
+    start_ms = time.time() * 1000
+    assert task_id.strip(), "Task ID is required"
+
+    current = _staging_current()
+    task = next((t for t in current if t["id"] == task_id), None)
+    assert task is not None, f"Task {task_id} not found"
+    assert task["status"] in ("staged", "pulled"), f"Can only drop staged or pulled tasks (current status: {task['status']})"
+
+    dropped = dict(task)
+    dropped["status"] = "dropped"
+    dropped["updated"] = datetime.now(timezone.utc).isoformat()
+    _staging_append(dropped)
+
+    _log("INFO", "drop", f"id={task_id}")
+
+    latency_ms = time.time() * 1000 - start_ms
+    return dropped, {"status": "success", "action": "dropped", "latency_ms": round(latency_ms, 2)}
+
+
+# =============================================================================
+# DASHBOARD — The War Room
+# =============================================================================
+
+_BUS_DASHBOARD_PATH = Path.cwd() / "bus-dashboard.html"
+_COORDINATOR_NAMES = frozenset({
+    "review-coordinator", "fix-coordinator",
+    "docs-coordinator", "research-coordinator",
+})
+_CHANNEL_COLORS = {
+    "agents:": "#58a6ff",
+    "coord:": "#bc8cff",
+    "research:": "#3fb950",
+    "alerts:": "#f7768e",
+    "watch:": "#8b949e",
+    "tick:": "#8b949e",
+    "results:": "#79c0ff",
+}
+_FEED_EXCLUDE_PREFIXES = ("tick:", "watch:")
+_DASHBOARD_PORT = 8420
+
+
+# -- Utility functions --------------------------------------------------------
+
+
+def _html_esc(s: str) -> str:
+    """HTML-escape a string."""
+    return _html_mod.escape(str(s))
+
+
+def _tooltip_esc(s: str) -> str:
+    """Escape for data-tooltip attributes. HTML-escape + newline to &#10;."""
+    return _html_mod.escape(str(s)).replace("\n", "&#10;")
+
+
+def _relative_time(ts: str | int | float) -> str:
+    """Convert ISO timestamp or epoch to human-relative string."""
+    if isinstance(ts, str):
+        try:
+            dt = datetime.fromisoformat(ts)
+        except ValueError:
+            return str(ts)
+    elif isinstance(ts, (int, float)):
+        dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+    else:
+        return str(ts)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    delta = datetime.now(timezone.utc) - dt
+    seconds = int(delta.total_seconds())
+    if seconds < 0:
+        return "just now"
+    if seconds < 60:
+        return f"{seconds}s ago"
+    if seconds < 3600:
+        return f"{seconds // 60}m ago"
+    if seconds < 86400:
+        h, m = seconds // 3600, (seconds % 3600) // 60
+        return f"{h}h {m}m ago"
+    return f"{seconds // 86400}d ago"
+
+
+def _human_duration(seconds: float) -> str:
+    """Convert seconds to readable duration: 4h 23m, 2d 5h, 45m, 12s."""
+    s = int(seconds)
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m {s % 60}s"
+    if s < 86400:
+        return f"{s // 3600}h {(s % 3600) // 60}m"
+    return f"{s // 86400}d {(s % 86400) // 3600}h"
+
+
+def _channel_color(channel: str) -> str:
+    """Hex color for a channel based on prefix matching."""
+    bare = channel.split("/")[-1] if "/" in channel else channel
+    for prefix, color in _CHANNEL_COLORS.items():
+        if bare.startswith(prefix):
+            return color
+    return "#8b949e"
+
+
+def _strip_project(channel: str) -> str:
+    """Remove project/ prefix from channel for display."""
+    return channel.split("/", 1)[1] if "/" in channel else channel
+
+
+def _payload_summary(payload: dict | str | None) -> str:
+    """Extract a one-line summary from a message payload."""
+    if payload is None:
+        return "\u2014"
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except (json.JSONDecodeError, TypeError):
+            return str(payload)[:120]
+    if isinstance(payload, dict):
+        if not payload:
+            return "\u2014"
+        for key in ("summary", "title", "task", "content", "status", "msg", "message"):
+            if key in payload:
+                val = str(payload[key])
+                return val[:120] + ("\u2026" if len(val) > 120 else "")
+        raw = json.dumps(payload, default=str)
+        return raw[:120] + ("\u2026" if len(raw) > 120 else "")
+    return str(payload)[:120]
+
+
+# -- Data collection ----------------------------------------------------------
+
+
+def _collect_dashboard_data(socket_path: str = DEFAULT_SOCKET) -> dict | None:
+    """Collect all data for dashboard rendering in one pass.
+
+    Returns dict with keys: status, agents, triggers, channels,
+    activity, research, coord_tasks, coord_results, failures.
+    Returns None if bus daemon is not running.
+    """
+    try:
+        status = _bus_request({"cmd": "status"}, socket_path)
+        if not status.get("ok"):
+            return None
+    except Exception:
+        return None
+
+    project = _detect_project()
+    agents = _bus_request({"cmd": "agent-list"}, socket_path)
+    triggers = _bus_request({"cmd": "trigger-list"}, socket_path)
+    channels = _bus_request({"cmd": "channels"}, socket_path)
+
+    # Audit log — direct file read, no bus connection needed
+    activity, _ = _query_audit_impl(since="1h", limit=100)
+
+    # Channel subscriptions for coordinator + research data
+    research = _bus_request(
+        {"cmd": "subscribe", "channel": "research:*", "count": 50},
+        socket_path,
+    )
+    coord_tasks = _bus_request(
+        {"cmd": "subscribe", "channel": "coord:*-tasks", "count": 50},
+        socket_path,
+    )
+    coord_results = _bus_request(
+        {"cmd": "subscribe", "channel": "coord:*-results", "count": 50},
+        socket_path,
+    )
+
+    # Failures in last 1h (clears once resolved)
+    failures, _ = _query_audit_impl(
+        channel=f"{project}/agents:failed", since="1h", limit=50,
+    )
+
+    return {
+        "status": status,
+        "agents": agents,
+        "triggers": triggers,
+        "channels": channels,
+        "activity": activity,
+        "research": research,
+        "coord_tasks": coord_tasks,
+        "coord_results": coord_results,
+        "failures": failures,
+    }
+
+
+# -- Overall status computation -----------------------------------------------
+
+
+def _compute_overall_status(data: dict) -> str:
+    """Determine overall health: green, amber, or red."""
+    agents_list = data.get("agents", {}).get("agents", [])
+    coord_running = {
+        a["name"]
+        for a in agents_list
+        if a.get("name") in _COORDINATOR_NAMES and a.get("status") == "running"
+    }
+
+    # Red: any coordinator missing or not running
+    if len(coord_running) < len(_COORDINATOR_NAMES):
+        return "red"
+
+    # Amber: real failures in last 1h (ignore timeout_exhausted — expected for big tasks)
+    failures = data.get("failures", [])
+    real_failures = [
+        f for f in failures
+        if "timeout_exhausted" not in str(f.get("payload_preview", ""))
+    ]
+    if real_failures:
+        return "amber"
+
+    # Amber: no bus activity for >5 min despite being up
+    status = data.get("status", {})
+    activity = data.get("activity", [])
+    if status.get("uptime_seconds", 0) > 300 and not activity:
+        return "amber"
+
+    return "green"
+
+
+# -- Panel renderers ----------------------------------------------------------
+
+
+def _render_health_bar(data: dict) -> str:
+    """P1: System health bar -- top strip."""
+    status = data.get("status", {})
+    overall = _compute_overall_status(data)
+
+    labels = {
+        "green": "All Systems Operational",
+        "amber": "Degraded",
+        "red": "Failures Detected",
+    }
+    uptime = _human_duration(status.get("uptime_seconds", 0))
+    msgs = status.get("messages_total", 0)
+    chans = status.get("channels", 0)
+    pid = status.get("pid", "?")
+    generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    tip = _tooltip_esc(
+        f"{msgs} messages \u2022 {chans} channels \u2022 PID {pid} \u2022 Generated {generated}"
+    )
+
+    return (
+        f'<div id="health-bar" class="health-bar health-{overall}"'
+        f' data-tooltip="{tip}">'
+        f'<span class="health-dot"></span>'
+        f'<span class="health-label">{_html_esc(labels[overall])}</span>'
+        f'<span class="health-uptime">{_html_esc(uptime)}</span>'
+        f'</div>'
+    )
+
+
+def _render_coordinators(data: dict) -> str:
+    """P2: Coordinator cards."""
+    agents_list = data.get("agents", {}).get("agents", [])
+    coord_map = {a["name"]: a for a in agents_list if a.get("name") in _COORDINATOR_NAMES}
+    tasks = data.get("coord_tasks", {}).get("recent", [])
+    results = data.get("coord_results", {}).get("recent", [])
+
+    cards = []
+    for name in sorted(_COORDINATOR_NAMES):
+        short = name.replace("-coordinator", "")
+        agent = coord_map.get(name)
+
+        if agent is None:
+            cards.append(
+                f'<div class="coord-card coord-missing"'
+                f' data-tooltip="Coordinator not spawned">'
+                f'<span class="coord-dot status-red">\u25cf</span>'
+                f'<span class="coord-name">{_html_esc(short)}</span>'
+                f'<span class="coord-state">Missing</span>'
+                f'</div>'
+            )
+            continue
+
+        st = agent.get("status", "unknown")
+        st_class = "green" if st == "running" else "red"
+        msgs_processed = agent.get("messages_processed", 0)
+        spawned = agent.get("spawned_at", "")
+        up = _relative_time(spawned) if spawned else "?"
+
+        # Find last task and result for this coordinator
+        role_tasks = [t for t in tasks
+                      if _strip_project(t.get("channel", "")) == f"coord:{short}-tasks"]
+        role_results = [r for r in results
+                        if _strip_project(r.get("channel", "")) == f"coord:{short}-results"]
+
+        last_task = role_tasks[-1] if role_tasks else None
+        last_result = role_results[-1] if role_results else None
+
+        # Derive current state
+        if last_task and last_result:
+            task_ts = last_task.get("timestamp", "")
+            result_ts = last_result.get("timestamp", "")
+            if task_ts > result_ts:
+                task_title = _payload_summary(last_task.get("payload"))
+                state = f"Working: {task_title[:40]}"
+            else:
+                state = "Idle"
+        elif last_task and not last_result:
+            task_title = _payload_summary(last_task.get("payload"))
+            state = f"Working: {task_title[:40]}"
+        else:
+            state = "No activity"
+
+        # Tooltip
+        last_r_summary = _payload_summary(last_result.get("payload")) if last_result else "none"
+        tip_lines = [
+            f"\U0001f4e8 {msgs_processed} processed",
+            f"Last: {last_r_summary[:60]}",
+            f"\u23f1 Up {up}",
+        ]
+        tip = _tooltip_esc("\n".join(tip_lines))
+
+        cards.append(
+            f'<div class="coord-card coord-{"working" if state.startswith("Working") else st}"'
+            f' data-tooltip="{tip}">'
+            f'<span class="coord-dot status-{st_class}">\u25cf</span>'
+            f'<span class="coord-name">{_html_esc(short)}</span>'
+            f'<span class="coord-state">{_html_esc(state)}</span>'
+            f'</div>'
+        )
+
+    return (
+        '<div id="panel-coordinators" class="section coord-section">'
+        '<h2 class="section-title">Coordinators</h2>'
+        '<div class="coord-grid">'
+        + "".join(cards)
+        + '</div></div>'
+    )
+
+
+def _render_agents(data: dict) -> str:
+    """P3: Non-coordinator bus agents grid."""
+    agents_list = data.get("agents", {}).get("agents", [])
+    non_coord = [a for a in agents_list if a.get("name") not in _COORDINATOR_NAMES]
+
+    if not non_coord:
+        return (
+            '<div id="panel-agents" class="section agent-section">'
+            '<h2 class="section-title">Agents</h2>'
+            '<p class="empty">No utility agents running</p>'
+            '</div>'
+        )
+
+    cards = []
+    for a in non_coord:
+        name = a.get("name", "?")
+        st = a.get("status", "unknown")
+        st_class = "green" if st == "running" else "red" if st == "retired" else "grey"
+        channels = [
+            _strip_project(c) for c in a.get("channels", [])
+            if not c.startswith("_sanctum/")
+        ]
+        msgs = a.get("messages_processed", 0)
+        spawned = a.get("spawned_at", "")
+        tip_lines = [
+            f"\U0001f4e1 {', '.join(channels) or '(inbox only)'}",
+            f"\U0001f4e8 {msgs} processed",
+            f"Spawned {_relative_time(spawned)}" if spawned else "",
+        ]
+        tip = _tooltip_esc("\n".join(line for line in tip_lines if line))
+
+        cards.append(
+            f'<div class="agent-card agent-{st}"'
+            f' data-tooltip="{tip}">'
+            f'<span class="agent-dot status-{st_class}">\u25cf</span>'
+            f'<span class="agent-name">{_html_esc(name)}</span>'
+            f'</div>'
+        )
+
+    return (
+        '<div id="panel-agents" class="section agent-section">'
+        '<h2 class="section-title">Agents</h2>'
+        '<div class="agent-grid">'
+        + "".join(cards)
+        + '</div></div>'
+    )
+
+
+def _render_active_tasks(data: dict) -> str:
+    """P3.5: Split activity — current missions (left) + completed history (right)."""
+    tasks = data.get("coord_tasks", {}).get("recent", [])
+    results = data.get("coord_results", {}).get("recent", [])
+    activity = data.get("activity", [])
+
+    if not tasks:
+        return '<div id="panel-active-tasks"></div>'
+
+    # -- Classify tasks: top-level (from primary agent) vs sub-tasks (from coordinators)
+    top_level: list[dict] = []
+    sub_tasks: list[dict] = []
+    coord_sources = {n.replace("-coordinator", "") for n in _COORDINATOR_NAMES}
+
+    for t in tasks:
+        src = t.get("source", "")
+        # Sub-task if source is a coordinator name or agent:ID
+        is_sub = any(cs in src for cs in coord_sources) or src.startswith("agent:")
+        (sub_tasks if is_sub else top_level).append(t)
+
+    # -- Build missions from top-level tasks, keyed by correlation_id
+    missions: dict[str, dict] = {}
+    for t in top_level:
+        cid = t.get("correlation_id", "") or t.get("id", "?")
+        ch = _strip_project(t.get("channel", ""))
+        coord = ch.replace("coord:", "").replace("-tasks", "")
+        payload = t.get("payload", {})
+        if isinstance(payload, str):
+            try:
+                payload = ast.literal_eval(payload)
+            except Exception:
+                try:
+                    payload = json.loads(payload)
+                except Exception:
+                    pass
+        title = ""
+        if isinstance(payload, dict):
+            title = payload.get("title", "") or _payload_summary(payload)
+        if not title:
+            title = _payload_summary(payload)
+
+        if cid not in missions:
+            missions[cid] = {
+                "title": title,
+                "coordinator": coord,
+                "sub_coordinators": set(),
+                "sub_count": 0,
+                "completed_count": 0,
+                "first_ts": t.get("timestamp", ""),
+                "last_result_ts": "",
+            }
+        else:
+            missions[cid]["sub_coordinators"].add(coord)
+
+    # -- Attach sub-tasks to their parent missions
+    for t in sub_tasks:
+        cid = t.get("correlation_id", "")
+        if cid not in missions:
+            continue
+        missions[cid]["sub_count"] += 1
+        ch = _strip_project(t.get("channel", ""))
+        coord = ch.replace("coord:", "").replace("-tasks", "")
+        missions[cid]["sub_coordinators"].add(coord)
+
+    # -- Count completed results per mission correlation_id
+    for r in results:
+        cid = r.get("correlation_id", "")
+        if cid not in missions:
+            continue
+        payload = r.get("payload", {})
+        if isinstance(payload, str):
+            try:
+                payload = ast.literal_eval(payload)
+            except Exception:
+                try:
+                    payload = json.loads(payload)
+                except Exception:
+                    payload = {}
+        st = ""
+        if isinstance(payload, dict):
+            st = str(payload.get("status", "")).lower()
+        if st in ("completed", "complete", "success", "compliant", "already_compliant", "failed"):
+            missions[cid]["completed_count"] += 1
+            rts = r.get("timestamp", "")
+            if rts > missions[cid]["last_result_ts"]:
+                missions[cid]["last_result_ts"] = rts
+
+    # -- Extract active workers from agent lifecycle events
+    workers: dict[str, list[dict]] = {}
+    for evt in activity:
+        ch = _strip_project(evt.get("channel", ""))
+        if ch not in ("agents:started", "agents:completed", "agents:failed"):
+            continue
+        cid = evt.get("correlation_id", "")
+        if not cid:
+            continue
+        payload = evt.get("payload") or evt.get("payload_preview", "")
+        if isinstance(payload, str):
+            try:
+                payload = ast.literal_eval(payload)
+            except Exception:
+                try:
+                    payload = json.loads(payload)
+                except Exception:
+                    payload = {}
+        if isinstance(payload, dict):
+            workers.setdefault(cid, []).append({
+                "agent": payload.get("agent", ""),
+                "action": ch.split(":")[-1],
+                "detail": payload.get("summary", payload.get("file", "")),
+                "ts": evt.get("timestamp", ""),
+            })
+
+    # -- Classify missions as current vs completed
+    current_missions: list[tuple[str, dict]] = []
+    completed_missions: list[tuple[str, dict]] = []
+
+    for cid, m in sorted(missions.items(), key=lambda x: x[1]["first_ts"], reverse=True):
+        sub_count = m["sub_count"]
+        completed = m["completed_count"]
+        # Staleness: flag missions with no activity for >30min
+        stale = False
+        if m["last_result_ts"]:
+            try:
+                last_dt = datetime.fromisoformat(m["last_result_ts"])
+                stale = (datetime.now(timezone.utc) - last_dt).total_seconds() > 1800
+            except (ValueError, TypeError):
+                pass
+        m["stale"] = stale
+        is_done = (
+            (sub_count == 0 and completed > 0)
+            or (sub_count > 0 and completed >= sub_count)
+        )
+        if is_done:
+            completed_missions.append((cid, m))
+        else:
+            current_missions.append((cid, m))
+
+    # -- Render CURRENT activity cards (left column)
+    current_cards: list[str] = []
+    for cid, m in current_missions:
+        title = m["title"]
+        coord = m["coordinator"]
+        sub_coords = m["sub_coordinators"]
+        sub_count = m["sub_count"]
+        completed = m["completed_count"]
+
+        chain_parts = [coord]
+        for sc in sorted(sub_coords):
+            if sc != coord:
+                chain_parts.append(sc)
+        chain = " \u2192 ".join(chain_parts)
+
+        if m.get("stale"):
+            s_class, s_dot, s_label = "stale", "status-red", f"STALE {completed}/{sub_count}"
+        elif sub_count == 0:
+            s_class, s_dot, s_label = "active", "status-accent", "Active"
+        elif completed > 0:
+            s_class, s_dot, s_label = "working", "status-amber", f"{completed}/{sub_count}"
+        else:
+            s_class, s_dot, s_label = "active", "status-accent", f"0/{sub_count}"
+
+        # Worker badges
+        mission_workers = workers.get(cid, [])
+        worker_html = ""
+        if mission_workers:
+            seen: set[str] = set()
+            unique: list[dict] = []
+            for w in sorted(mission_workers, key=lambda x: x["ts"], reverse=True):
+                agent = w["agent"]
+                if agent and agent not in seen:
+                    seen.add(agent)
+                    unique.append(w)
+            w_parts: list[str] = []
+            for w in unique[:6]:
+                dc = "status-green" if w["action"] == "completed" else "status-amber" if w["action"] == "started" else "status-red"
+                w_parts.append(
+                    f'<span class="task-worker"><span class="{dc}">\u25cf</span> {_html_esc(w["agent"])}</span>'
+                )
+            if w_parts:
+                worker_html = '<div class="task-workers">' + "".join(w_parts) + '</div>'
+
+        tip_parts = [f"Correlation: {cid}"]
+        if sub_count:
+            tip_parts.append(f"Sub-tasks: {completed}/{sub_count} completed")
+        tip_parts.append(f"Coordinators: {chain}")
+        started = _relative_time(m["first_ts"]) if m["first_ts"] else "?"
+        tip_parts.append(f"Started: {started}")
+        tip = _tooltip_esc("\n".join(tip_parts))
+
+        current_cards.append(
+            f'<div class="task-card task-{s_class}" data-tooltip="{tip}">'
+            f'<div class="task-header">'
+            f'<span class="task-dot {s_dot}">\u25cf</span>'
+            f'<span class="task-title">{_html_esc(title[:80])}</span>'
+            f'<span class="task-status">{_html_esc(s_label)}</span>'
+            f'</div>'
+            f'<div class="task-meta">{_html_esc(chain)}{worker_html}</div>'
+            f'</div>'
+        )
+
+    # -- Render COMPLETED activity rows (right column)
+    completed_rows: list[str] = []
+    for cid, m in completed_missions:
+        title = m["title"]
+        coord = m["coordinator"]
+        sub_coords = m["sub_coordinators"]
+        sub_count = m["sub_count"]
+        completed = m["completed_count"]
+
+        chain_parts = [coord]
+        for sc in sorted(sub_coords):
+            if sc != coord:
+                chain_parts.append(sc)
+        chain = " \u2192 ".join(chain_parts)
+
+        # Compute runtime
+        started_ts = m["first_ts"]
+        finished_ts = m["last_result_ts"]
+        runtime = ""
+        if started_ts and finished_ts:
+            try:
+                t0 = datetime.fromisoformat(started_ts)
+                t1 = datetime.fromisoformat(finished_ts)
+                delta = (t1 - t0).total_seconds()
+                runtime = _human_duration(max(0, delta))
+            except (ValueError, TypeError):
+                pass
+
+        started_rel = _relative_time(started_ts) if started_ts else "?"
+        finished_rel = _relative_time(finished_ts) if finished_ts else "?"
+
+        # Success indicator
+        if sub_count > 0 and completed >= sub_count:
+            result_icon = '<span class="status-green">\u2713</span>'
+            result_text = f"{completed}/{sub_count}"
+        else:
+            result_icon = '<span class="status-green">\u2713</span>'
+            result_text = "Done"
+
+        tip_parts = [
+            f"Correlation: {cid}",
+            f"Coordinators: {chain}",
+            f"Started: {started_rel}",
+            f"Finished: {finished_rel}",
+        ]
+        if runtime:
+            tip_parts.append(f"Runtime: {runtime}")
+        if sub_count:
+            tip_parts.append(f"Sub-tasks: {completed}/{sub_count}")
+        tip = _tooltip_esc("\n".join(tip_parts))
+
+        completed_rows.append(
+            f'<div class="completed-row" data-tooltip="{tip}">'
+            f'<span class="completed-icon">{result_icon}</span>'
+            f'<span class="completed-title">{_html_esc(title[:60])}</span>'
+            f'<span class="completed-coord">{_html_esc(chain)}</span>'
+            f'<span class="completed-runtime">{_html_esc(runtime) if runtime else "\u2014"}</span>'
+            f'</div>'
+        )
+
+    # -- Assemble the split layout
+    if not current_cards and not completed_rows:
+        return '<div id="panel-active-tasks"></div>'
+
+    left_html = ""
+    if current_cards:
+        left_html = (
+            '<div class="activity-col activity-current">'
+            '<h3 class="activity-subtitle">Current Activity</h3>'
+            '<div class="tasks-list">'
+            + "".join(current_cards)
+            + '</div></div>'
+        )
+    else:
+        left_html = (
+            '<div class="activity-col activity-current">'
+            '<h3 class="activity-subtitle">Current Activity</h3>'
+            '<p class="empty">No active missions</p>'
+            '</div>'
+        )
+
+    right_html = ""
+    if completed_rows:
+        right_html = (
+            '<div class="activity-col activity-completed">'
+            '<h3 class="activity-subtitle">Completed Activity</h3>'
+            '<div class="completed-list">'
+            + "".join(completed_rows)
+            + '</div></div>'
+        )
+
+    return (
+        '<div id="panel-active-tasks" class="section tasks-section">'
+        '<h2 class="section-title">Activity</h2>'
+        '<div class="activity-row">'
+        + left_html + right_html
+        + '</div></div>'
+    )
+
+
+
+
+
+def _render_triggers(data: dict) -> str:
+    """P4: Triggers compact strip, grouped by type."""
+    trigger_list = data.get("triggers", {}).get("triggers", [])
+
+    if not trigger_list:
+        return (
+            '<div id="panel-triggers" class="section trigger-section">'
+            '<h2 class="section-title">Triggers</h2>'
+            '<p class="empty">No active triggers</p>'
+            '</div>'
+        )
+
+    type_icons = {"file": "\U0001f4c1", "schedule": "\u23f0", "url": "\U0001f310"}
+    type_order = {"file": 0, "schedule": 1, "url": 2}
+
+    # Sort by type then channel for grouping
+    sorted_triggers = sorted(
+        trigger_list,
+        key=lambda t: (type_order.get(t.get("type", ""), 9), t.get("channel", "")),
+    )
+
+    rows = []
+    for t in sorted_triggers:
+        ttype = t.get("type", "?")
+        icon = type_icons.get(ttype, "\u2753")
+        channel = _strip_project(t.get("channel", ""))
+        st = t.get("status", "unknown")
+        st_class = "green" if st == "running" else "red"
+        config = t.get("config", {})
+
+        # Config summary with human-readable times
+        if ttype == "file":
+            detail = config.get("path", "?")
+            if config.get("recursive"):
+                detail += " (recursive)"
+            events = config.get("events", [])
+            if events:
+                detail += f"\nEvents: {', '.join(events)}"
+        elif ttype == "schedule":
+            interval = config.get("interval_seconds", 0)
+            label = config.get("label", "")
+            detail = f"every {_human_duration(interval)}" + (f" ({label})" if label else "")
+        elif ttype == "url":
+            url = config.get("url", "?")[:60]
+            interval = config.get("interval_seconds", 0)
+            detail = f"{url}\nPolling: every {_human_duration(interval)}" if interval else url
+        else:
+            detail = json.dumps(config)[:60]
+
+        tid = t.get("id", "?")[:8]
+        tip = _tooltip_esc(f"{detail}\nID: {tid}")
+
+        rows.append(
+            f'<div class="trigger-row" data-tooltip="{tip}">'
+            f'<span class="trigger-type">{icon}</span>'
+            f'<span class="trigger-channel">{_html_esc(channel)}</span>'
+            f'<span class="trigger-dot status-{st_class}">\u25cf</span>'
+            f'</div>'
+        )
+
+    return (
+        '<div id="panel-triggers" class="section trigger-section">'
+        '<h2 class="section-title">Triggers</h2>'
+        '<div class="trigger-list">'
+        + "".join(rows)
+        + '</div></div>'
+    )
+
+
+
+
+def _render_research(data: dict) -> str:
+    """P5: Research pipeline -- conditional, only if activity in last hour."""
+    research_msgs = data.get("research", {}).get("recent", [])
+    coord_tasks = data.get("coord_tasks", {}).get("recent", [])
+    coord_results = data.get("coord_results", {}).get("recent", [])
+
+    # Filter to research-related coordinator messages
+    research_tasks = [
+        t for t in coord_tasks
+        if "research" in _strip_project(t.get("channel", ""))
+    ]
+    research_results = [
+        r for r in coord_results
+        if "research" in _strip_project(r.get("channel", ""))
+    ]
+
+    # No research activity -> omit panel entirely
+    if not research_msgs and not research_tasks:
+        return '<div id="panel-research"></div>'
+
+    # Group by correlation_id
+    groups: dict[str, list] = {}
+    for msg in research_tasks + research_results + research_msgs:
+        cid = msg.get("correlation_id", "")
+        if cid:
+            groups.setdefault(cid, []).append(msg)
+
+    cards = []
+    for cid, msgs in groups.items():
+        # Sort by timestamp
+        msgs.sort(key=lambda m: m.get("timestamp", ""))
+
+        # Derive topic from first task
+        topic = "Research"
+        for m in msgs:
+            p = m.get("payload", {})
+            if isinstance(p, dict) and p.get("topic"):
+                topic = p["topic"]
+                break
+            summary = _payload_summary(p)
+            if summary and summary != "Research":
+                topic = summary[:60]
+                break
+
+        # Derive phase from last message
+        last = msgs[-1]
+        last_ch = _strip_project(last.get("channel", ""))
+        last_payload = last.get("payload", {})
+        if isinstance(last_payload, str):
+            try:
+                last_payload = json.loads(last_payload)
+            except (json.JSONDecodeError, TypeError):
+                last_payload = {}
+
+        if "research:complete" in last_ch or (isinstance(last_payload, dict) and last_payload.get("status") == "complete"):
+            phase, phase_class = "Complete", "complete"
+        elif "coord:docs" in last_ch and "results" in last_ch:
+            phase, phase_class = "Documented", "complete"
+        elif "coord:docs" in last_ch:
+            phase, phase_class = "Documenting", "documenting"
+        elif "research:finding" in last_ch or "research:" in last_ch:
+            phase, phase_class = "Researching", "researching"
+        elif isinstance(last_payload, dict) and last_payload.get("type") == "rfi":
+            phase, phase_class = "RFI", "rfi"
+        else:
+            phase, phase_class = "Active", "researching"
+
+        findings_count = sum(
+            1 for m in msgs if "finding" in _strip_project(m.get("channel", ""))
+        )
+
+        # Build timeline for tooltip
+        timeline_lines = []
+        for m in msgs[-5:]:
+            ts = _relative_time(m.get("timestamp", ""))
+            ch = _strip_project(m.get("channel", ""))
+            timeline_lines.append(f"{ts} \u2022 {ch}")
+
+        tip = _tooltip_esc(
+            "\n".join(timeline_lines) + f"\n\U0001f517 {cid[:8]}"
+        )
+
+        cards.append(
+            f'<div class="research-card" data-tooltip="{tip}">'
+            f'<span class="research-phase phase-{phase_class}">{_html_esc(phase)}</span>'
+            f'<span class="research-topic">{_html_esc(topic)}</span>'
+            f'<span class="research-findings">\U0001f4cb {findings_count}</span>'
+            f'</div>'
+        )
+
+    if not cards:
+        return '<div id="panel-research"></div>'
+
+    return (
+        '<div id="panel-research" class="section research-section">'
+        '<h2 class="section-title">Research Pipeline</h2>'
+        '<div class="research-list">'
+        + "".join(cards)
+        + '</div></div>'
+    )
+
+
+def _render_intel_feed() -> str:
+    """Render intel log entries as rich cards."""
+    intel_log = Path(__file__).resolve().parent.parent / "data" / "intel_log.jsonl"
+    if not intel_log.exists():
+        return '<div class="intel-scroll"><p class="empty">No intel entries yet</p></div>'
+
+    entries: list[dict] = []
+    with open(intel_log) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entries.append(json.loads(line))
+            except (json.JSONDecodeError, TypeError):
+                continue
+
+    entries.reverse()  # most recent first
+    entries = entries[:30]
+
+    if not entries:
+        return '<div class="intel-scroll"><p class="empty">No intel entries yet</p></div>'
+
+    source_icons = {
+        "youtube": "\U0001f4fa",  # 📺
+        "x": "\U0001d54f",  # 𝕏
+        "subject": "\U0001f50d",  # 🔍
+        "youtube-music": "\U0001f3b5",  # 🎵
+    }
+    relevance_colors = {
+        "high": "#f7768e",
+        "medium": "#e0af68",
+        "low": "#7aa2f7",
+        "noise": "#565f89",
+    }
+
+    cards: list[str] = []
+    for entry in entries:
+        source = entry.get("source", "unknown")
+        src_type = entry.get("type", "subject")
+        icon = source_icons.get(src_type, "\U0001f4cb")
+        title = _html_esc(entry.get("title", "Untitled"))
+        analysis = _html_esc(entry.get("analysis", ""))
+        relevance = entry.get("relevance", "medium")
+        rel_color = relevance_colors.get(relevance, "#565f89")
+        ts = _relative_time(entry.get("timestamp", ""))
+        urls = entry.get("urls", [])
+        followup = _html_esc(entry.get("followup", ""))
+
+        url_links = ""
+        if urls:
+            link_items = []
+            for u in urls[:3]:
+                domain = u.split("/")[2] if len(u.split("/")) > 2 else "link"
+                link_items.append(f'<a href="{_html_esc(u)}" target="_blank" class="intel-link">{_html_esc(domain)}</a>')
+            url_links = f'<span class="intel-urls">\U0001f517 {"  ".join(link_items)}</span>'
+
+        followup_html = ""
+        if followup:
+            followup_html = f'<div class="intel-followup">\u2192 {followup}</div>'
+
+        # Truncate analysis for card display, full in tooltip
+        analysis_short = analysis[:250] + ("\u2026" if len(analysis) > 250 else "")
+        tip = _tooltip_esc(entry.get("analysis", ""))
+
+        cards.append(
+            f'<div class="intel-entry intel-{relevance}" data-tooltip="{tip}">'
+            f'<div class="intel-header">'
+            f'<span class="intel-icon">{icon}</span>'
+            f'<span class="intel-source">{_html_esc(source)}</span>'
+            f'<span class="intel-relevance" style="background:{rel_color}25;color:{rel_color};'
+            f'border:1px solid {rel_color}50">{_html_esc(relevance.upper())}</span>'
+            f'<span class="intel-time">{_html_esc(ts)}</span>'
+            f'</div>'
+            f'<div class="intel-title">{title}</div>'
+            f'<div class="intel-analysis">{analysis_short}</div>'
+            f'<div class="intel-meta">'
+            f'{url_links}'
+            f'{followup_html}'
+            f'</div>'
+            f'</div>'
+        )
+
+    return '<div class="intel-scroll">' + "".join(cards) + '</div>'
+
+
+def _render_activity_feed(data: dict) -> str:
+    """P6: Combined intel + debug activity panel with toggle."""
+    # -- Intel panel --
+    intel_html = _render_intel_feed()
+
+    # -- Debug panel (existing event log) --
+    activity = data.get("activity", [])
+    filtered = []
+    for entry in activity:
+        ch = _strip_project(entry.get("channel", ""))
+        if any(ch.startswith(p) for p in _FEED_EXCLUDE_PREFIXES):
+            continue
+        filtered.append(entry)
+
+    filtered.sort(key=lambda e: e.get("timestamp", ""), reverse=True)
+    filtered = filtered[:50]
+
+    if not filtered:
+        debug_html = '<div class="feed-scroll"><p class="empty">No recent events</p></div>'
+    else:
+        rows = []
+        for entry in filtered:
+            ts = _relative_time(entry.get("timestamp", ""))
+            ch = _strip_project(entry.get("channel", ""))
+            color = _channel_color(entry.get("channel", ""))
+            source = entry.get("source", "")
+            payload = entry.get("payload") or entry.get("payload_preview", "")
+            if isinstance(payload, str):
+                try:
+                    payload = ast.literal_eval(payload)
+                except Exception:
+                    pass
+            summary = _payload_summary(payload)
+            cid = entry.get("correlation_id", "")
+
+            full_payload = json.dumps(payload, indent=2, default=str) if isinstance(payload, dict) else str(payload)
+            if len(full_payload) > 500:
+                full_payload = full_payload[:500] + "\u2026"
+            tip_lines = [full_payload]
+            if source:
+                tip_lines.append(f"Source: {source}")
+            if cid:
+                tip_lines.append(f"\U0001f517 {cid[:12]}")
+            tip_lines.append(entry.get("timestamp", ""))
+            tip = _tooltip_esc("\n".join(tip_lines))
+
+            rows.append(
+                f'<div class="feed-entry" data-tooltip="{tip}">'
+                f'<span class="feed-time">{_html_esc(ts)}</span>'
+                f'<span class="feed-channel" style="background:{color}20;color:{color};'
+                f'border:1px solid {color}40">{_html_esc(ch)}</span>'
+                f'<span class="feed-summary">{_html_esc(summary)}</span>'
+                f'</div>'
+            )
+        debug_html = '<div class="feed-scroll">' + "".join(rows) + '</div>'
+
+    debug_count = len(filtered)
+
+    return (
+        f'<div id="panel-activity" class="section feed-section">'
+        f'<h2 class="section-title">'
+        f'<span class="feed-toggle">'
+        f'<button class="toggle-btn active" data-view="intel" onclick="toggleFeed(\'intel\')">Intel</button>'
+        f'<button class="toggle-btn" data-view="debug" onclick="toggleFeed(\'debug\')">Debug'
+        f'<span class="feed-count">{debug_count}</span></button>'
+        f'</span>'
+        f'</h2>'
+        f'<div id="feed-intel" class="feed-view active">{intel_html}</div>'
+        f'<div id="feed-debug" class="feed-view" style="display:none">{debug_html}</div>'
+        f'</div>'
+    )
+
+
+def _render_staging() -> str:
+    """Render staging queue panel."""
+    tasks = _staging_active()
+
+    if not tasks:
+        return (
+            '<div class="section" id="panel-staging">'
+            '<h2 class="section-title">\U0001f4cb Staging Queue</h2>'
+            '<p class="empty">No staged tasks</p>'
+            '</div>'
+        )
+
+    priority_colors = {
+        "critical": "#f7768e",
+        "high": "#e0af68",
+        "medium": "#7aa2f7",
+        "low": "#8b949e",
+    }
+    target_icons = {
+        "review": "\U0001f50d",
+        "fix": "\U0001f527",
+        "docs": "\U0001f4dd",
+        "research": "\U0001f52c",
+    }
+
+    cards: list[str] = []
+    for task in tasks:
+        tid = _html_esc(task.get("id", ""))
+        title = _html_esc(task.get("title", "Untitled"))
+        desc = _html_esc(task.get("description", ""))
+        desc_short = desc[:200] + ("\u2026" if len(desc) > 200 else "")
+        priority = task.get("priority", "medium")
+        target = task.get("target", "fix")
+        p_color = priority_colors.get(priority, "#8b949e")
+        t_icon = target_icons.get(target, "\U0001f4cb")
+        created = _relative_time(task.get("created", ""))
+        tip = _tooltip_esc(task.get("description", ""))
+
+        cards.append(
+            f'<div class="staging-card" data-tooltip="{tip}">'
+            f'<div class="staging-header">'
+            f'<span class="staging-priority" style="background:{p_color}25;color:{p_color};'
+            f'border:1px solid {p_color}50">{_html_esc(priority.upper())}</span>'
+            f'<span class="staging-target">{t_icon} {_html_esc(target)}</span>'
+            f'<span class="staging-id">{tid}</span>'
+            f'<span class="staging-time">{_html_esc(created)}</span>'
+            f'</div>'
+            f'<div class="staging-title">{title}</div>'
+            f'<div class="staging-desc">{desc_short}</div>'
+            f'</div>'
+        )
+
+    count = len(tasks)
+    header_detail = f'<span class="section-count">{count}</span>'
+
+    return (
+        f'<div class="section" id="panel-staging">'
+        f'<h2 class="section-title">\U0001f4cb Staging Queue {header_detail}</h2>'
+        f'<div class="staging-list">'
+        + "".join(cards)
+        + '</div></div>'
+    )
+
+
+def _render_all_panels(data: dict) -> dict:
+    """Render all panels and return as dict for JSON API."""
+    return {
+        "health_bar": _render_health_bar(data),
+        "coordinators": _render_coordinators(data),
+        "agents": _render_agents(data),
+        "staging": _render_staging(),
+        "active_tasks": _render_active_tasks(data),
+        "triggers": _render_triggers(data),
+        "research": _render_research(data),
+        "activity": _render_activity_feed(data),
+        "generated": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "overall_status": _compute_overall_status(data),
+    }
+
+
+# -- HTML Template + Error Page -----------------------------------------------
+
+_BUS_ERROR_TEMPLATE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>War Room — Offline</title>
+<style>
+:root { --bg:#0d1117; --fg:#c9d1d9; --border:#30363d; }
+body { font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+       display:flex; align-items:center; justify-content:center; min-height:100vh;
+       background:var(--bg); color:var(--fg); margin:0; }
+.error { text-align:center; max-width:400px; }
+.error h1 { font-size:3rem; margin:0; }
+.error h2 { color:#f7768e; margin:0.5rem 0; }
+.error p { color:#8b949e; line-height:1.6; }
+.error code { background:#161b22; padding:0.2em 0.5em; border-radius:3px;
+              border:1px solid var(--border); color:#58a6ff; }
+</style>
+</head>
+<body>
+<div class="error">
+  <h1>\U0001f534</h1>
+  <h2>Bus Daemon Offline</h2>
+  <p>Cannot connect to the event bus. Start it with:</p>
+  <p><code>sfs_events.py serve</code></p>
+  <p>Then refresh this page.</p>
+</div>
+</body>
+</html>"""
+
+
+_BUS_DASHBOARD_TEMPLATE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>War Room \u2014 __PROJECT__</title>
+<style>
+:root {
+    --bg:      #0d1117;
+    --fg:      #c9d1d9;
+    --accent:  #58a6ff;
+    --border:  #30363d;
+    --code-bg: #161b22;
+    --muted:   #8b949e;
+    --bright:  #e6edf3;
+}
+*, *::before, *::after { box-sizing:border-box; }
+body {
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+    background:var(--bg); color:var(--fg); margin:0; padding:1.25rem;
+    line-height:1.5;
+    display:flex; flex-direction:column; height:100vh; overflow-y:auto; box-sizing:border-box;
+    scrollbar-width:thin; scrollbar-color:var(--border) transparent;
+}
+header {
+    display:flex; align-items:baseline; gap:1rem;
+    margin-bottom:1.25rem; padding-bottom:0.75rem;
+    border-bottom:1px solid var(--border);
+}
+header h1 { margin:0; font-size:1.3rem; color:var(--bright); }
+header .meta { font-size:0.8rem; color:var(--muted); }
+#slot-activity { flex:1; display:flex; flex-direction:column; min-height:400px; }
+.footer { text-align:center; padding:0.5rem 0 0; font-size:0.75rem; color:var(--muted); flex-shrink:0; }
+
+/* Status colors */
+.status-green  { color:#3fb950; }
+.status-amber  { color:#e0af68; }
+.status-red    { color:#f7768e; }
+.status-grey   { color:#8b949e; }
+
+/* Tooltip system */
+[data-tooltip] { position:relative; cursor:default; }
+[data-tooltip]::after {
+    content:attr(data-tooltip);
+    position:absolute; top:100%; left:50%; transform:translateX(-50%);
+    background:#1c2128; color:#c9d1d9; padding:0.5rem 0.75rem;
+    border-radius:6px; border:1px solid #30363d;
+    font-size:0.78rem; line-height:1.4; white-space:pre-line;
+    z-index:100; pointer-events:none;
+    opacity:0; transition:opacity 0.15s ease-in;
+    min-width:200px; max-width:350px;
+    box-shadow:0 4px 12px rgba(0,0,0,0.4);
+    margin-top:4px;
+}
+[data-tooltip]:hover::after { opacity:1; }
+
+/* Health bar */
+.health-bar {
+    display:flex; align-items:center; gap:1.25rem;
+    padding:0.75rem 1.25rem; border-radius:8px;
+    margin-bottom:1.25rem; border:1px solid var(--border);
+}
+.health-green { background:#0d2818; border-color:#1a4d2e; }
+.health-amber { background:#2d2000; border-color:#4d3800; }
+.health-red   { background:#2d1520; border-color:#5c1a2a; }
+.health-dot {
+    width:10px; height:10px; border-radius:50%;
+    display:inline-block;
+}
+.health-green .health-dot { background:#3fb950; box-shadow:0 0 6px #3fb950; }
+.health-amber .health-dot { background:#e0af68; box-shadow:0 0 6px #e0af68; }
+.health-red   .health-dot { background:#f7768e; box-shadow:0 0 6px #f7768e; }
+.health-label { font-weight:600; font-size:0.95rem; color:var(--bright); }
+.health-uptime { font-size:0.85rem; color:var(--muted); margin-left:auto; }
+
+/* Connection lost indicator */
+.conn-lost {
+    display:none; align-items:center; gap:0.5rem;
+    padding:0.4rem 0.8rem; border-radius:6px;
+    background:#2d1520; border:1px solid #5c1a2a;
+    font-size:0.8rem; color:#f7768e; margin-left:auto;
+}
+.conn-lost.visible { display:flex; }
+
+/* Section containers */
+.section-row {
+    display:grid; grid-template-columns:1fr 1.5fr;
+    gap:1.25rem; margin-bottom:1.25rem;
+}
+.section {
+    background:var(--code-bg); border:1px solid var(--border);
+    border-radius:8px; padding:1rem;
+}
+.collapse-btn {
+    position:absolute; right:0; top:50%; transform:translateY(-50%);
+    background:none; border:1px solid var(--border); border-radius:4px;
+    color:var(--muted); font-size:0.85rem; width:1.4rem; height:1.4rem;
+    cursor:pointer; display:flex; align-items:center; justify-content:center;
+    line-height:1; padding:0; transition:color 0.15s, border-color 0.15s;
+}
+.collapse-btn:hover { color:var(--bright); border-color:var(--bright); }
+.section.collapsed > *:not(.section-title) { display:none !important; }
+.section.collapsed { padding-bottom:0.25rem; }
+.section-title {
+    font-size:0.75rem; text-transform:uppercase; letter-spacing:0.05em;
+    color:var(--muted); margin:0 0 0.75rem 0;
+}
+.empty { color:var(--muted); font-size:0.85rem; font-style:italic; margin:0.5rem 0; }
+
+/* Coordinator cards */
+.coord-grid { display:grid; grid-template-columns:1fr 1fr; gap:0.5rem; }
+.coord-card {
+    display:flex; align-items:center; gap:0.5rem;
+    padding:0.5rem 0.75rem; border-radius:6px;
+    background:var(--bg); border:1px solid var(--border);
+}
+.coord-card.coord-running { border-left:3px solid #3fb950; }
+.coord-card.coord-working { border-left:3px solid #58a6ff; background:#101d2e; }
+.coord-card.coord-missing { border-left:3px solid #f7768e; opacity:0.6; }
+.coord-card.coord-retired { border-left:3px solid #8b949e; opacity:0.5; }
+.coord-dot { font-size:0.6rem; line-height:1; }
+.coord-name { font-weight:600; font-size:0.85rem; color:var(--bright); }
+.coord-state {
+    font-size:0.75rem; color:var(--muted);
+    margin-left:auto; overflow:hidden;
+    text-overflow:ellipsis; white-space:nowrap; max-width:220px;
+}
+
+/* Agent cards */
+.agent-grid {
+    display:grid; grid-template-columns:repeat(auto-fill, minmax(160px, 1fr));
+    gap:0.5rem;
+}
+.agent-card {
+    display:flex; align-items:center; gap:0.5rem;
+    padding:0.4rem 0.65rem; border-radius:6px;
+    background:var(--bg); border:1px solid var(--border);
+}
+.agent-card.agent-running { border-left:2px solid #3fb950; }
+.agent-card.agent-active { border-left:2px solid #58a6ff; background:#101d2e; }
+.agent-card.agent-retired { border-left:2px solid #f7768e; opacity:0.5; }
+.agent-dot { font-size:0.5rem; line-height:1; }
+.agent-name { font-size:0.8rem; color:var(--fg); }
+
+
+/* Activity split layout */
+.tasks-section { margin-bottom:1.25rem; }
+.activity-row { display:grid; grid-template-columns:1fr 1fr; gap:1rem; }
+.activity-subtitle { font-size:0.8rem; color:var(--muted); margin:0 0 0.5rem; font-weight:600; text-transform:uppercase; letter-spacing:0.05em; }
+
+/* Current activity cards (left) */
+.tasks-list { display:flex; flex-direction:column; gap:0.5rem; }
+.task-card {
+    display:flex; flex-direction:column; gap:0.25rem;
+    padding:0.6rem 0.85rem; border-radius:6px;
+    background:var(--bg); border:1px solid var(--border);
+    border-left:3px solid var(--border);
+}
+.task-card.task-active  { border-left-color:#58a6ff; background:#101d2e; }
+.task-card.task-working { border-left-color:#e0af68; background:#1d1a0e; }
+.task-card.task-stale   { border-left-color:#f7768e; background:#2d1520; animation:stale-pulse 2s ease-in-out infinite; }
+@keyframes stale-pulse { 0%,100%{opacity:1} 50%{opacity:0.7} }
+.task-header { display:flex; align-items:center; gap:0.5rem; }
+.task-dot { font-size:0.55rem; line-height:1; flex-shrink:0; }
+.task-title {
+    font-weight:600; font-size:0.85rem; color:var(--bright);
+    overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+    flex:1; min-width:0;
+}
+.task-status {
+    font-size:0.75rem; color:var(--muted);
+    margin-left:auto; white-space:nowrap; flex-shrink:0;
+}
+.task-meta { font-size:0.75rem; color:var(--muted); padding-left:1.1rem; }
+.task-workers { display:inline-flex; gap:0.5rem; margin-left:0.75rem; }
+.task-worker { display:inline-flex; align-items:center; gap:0.25rem; font-size:0.7rem; }
+
+/* Completed activity list (right) */
+.completed-list { display:flex; flex-direction:column; gap:0.25rem; }
+.completed-row {
+    display:grid; grid-template-columns:1.25rem 1fr auto auto;
+    align-items:center; gap:0.5rem;
+    padding:0.35rem 0.6rem; border-radius:4px;
+    background:var(--bg); border:1px solid var(--border);
+    font-size:0.8rem; opacity:0.75;
+}
+.completed-row:hover { opacity:1; }
+.completed-icon { font-size:0.75rem; text-align:center; }
+.completed-title {
+    color:var(--fg); overflow:hidden;
+    text-overflow:ellipsis; white-space:nowrap;
+}
+.completed-coord { color:var(--muted); font-size:0.75rem; white-space:nowrap; }
+.completed-runtime { color:var(--muted); font-size:0.75rem; font-family:monospace; white-space:nowrap; }
+
+@media (max-width: 900px) {
+    .activity-row { grid-template-columns:1fr; }
+}
+
+/* Trigger strip */
+.trigger-section { margin-bottom:1.25rem; }
+.trigger-list { display:flex; flex-wrap:wrap; gap:0.5rem; }
+.trigger-row {
+    display:inline-flex; align-items:center; gap:0.4rem;
+    padding:0.35rem 0.65rem; border-radius:6px;
+    background:var(--bg); border:1px solid var(--border);
+    font-size:0.8rem;
+}
+.trigger-type { font-size:0.85rem; }
+.trigger-channel { font-family:monospace; font-size:0.75rem; color:var(--fg); }
+.trigger-dot { font-size:0.45rem; }
+
+/* Research pipeline */
+.research-section { margin-bottom:1.25rem; }
+.research-list {
+    display:flex; flex-direction:column; gap:0.5rem;
+    max-height:300px; overflow-y:auto;
+    scrollbar-width:thin; scrollbar-color:var(--border) transparent;
+}
+.research-card {
+    display:flex; align-items:center; gap:0.75rem;
+    padding:0.5rem 0.75rem; border-radius:6px;
+    background:var(--bg); border:1px solid var(--border);
+    border-left:3px solid #3fb950;
+}
+.research-phase {
+    display:inline-block; padding:0.15rem 0.5rem; border-radius:3px;
+    font-size:0.7rem; font-weight:600; text-transform:uppercase;
+    letter-spacing:0.03em; min-width:80px; text-align:center;
+}
+.phase-researching { background:#1a2332; color:#58a6ff; }
+.phase-documenting { background:#1e1533; color:#bc8cff; }
+.phase-rfi         { background:#2d2000; color:#e0af68; }
+.phase-complete    { background:#0d2818; color:#3fb950; }
+.research-topic { font-size:0.85rem; color:var(--bright); flex:1; }
+.research-findings { font-size:0.8rem; color:var(--muted); }
+
+/* Activity feed */
+.feed-section { margin-bottom:0; flex:1; display:flex; flex-direction:column; min-height:350px; }
+.feed-count { font-size:0.7rem; color:var(--muted); font-weight:normal; }
+.feed-scroll {
+    flex:1; overflow-y:auto; min-height:0;
+    scrollbar-width:thin; scrollbar-color:var(--border) transparent;
+    border:1px solid var(--border); border-radius:6px;
+    background:var(--bg);
+}
+.feed-entry {
+    display:flex; align-items:center; gap:0.65rem;
+    padding:0.35rem 0.65rem;
+    border-bottom:1px solid var(--border);
+    font-size:0.8rem;
+}
+.feed-entry:last-child { border-bottom:none; }
+.feed-entry:hover { background:var(--code-bg); }
+.feed-time { min-width:55px; color:var(--muted); font-size:0.75rem; }
+.feed-channel {
+    display:inline-block; padding:0.1rem 0.4rem; border-radius:3px;
+    font-size:0.7rem; font-weight:600;
+    min-width:70px; text-align:center; white-space:nowrap;
+}
+.feed-summary {
+    flex:1; overflow:hidden; text-overflow:ellipsis;
+    white-space:nowrap; color:var(--fg);
+}
+
+
+/* Feed toggle */
+.feed-toggle { display:flex; gap:0.25rem; }
+.toggle-btn {
+    background:var(--code-bg); border:1px solid var(--border); color:var(--muted);
+    padding:0.2rem 0.7rem; border-radius:4px; font-size:0.75rem; cursor:pointer;
+    transition:all 0.15s;
+}
+.toggle-btn.active { background:#1f6feb20; color:#58a6ff; border-color:#1f6feb50; }
+.toggle-btn .feed-count { margin-left:0.3rem; font-size:0.65rem; opacity:0.7; }
+.feed-view { flex:1; display:flex; flex-direction:column; min-height:0; }
+
+/* Intel cards */
+.intel-scroll {
+    flex:1; overflow-y:auto; min-height:0;
+    scrollbar-width:thin; scrollbar-color:var(--border) transparent;
+}
+.intel-entry {
+    padding:0.6rem 0.7rem; border-bottom:1px solid var(--border);
+    transition:background 0.1s;
+}
+.intel-entry:hover { background:var(--code-bg); }
+.intel-header { display:flex; align-items:center; gap:0.5rem; margin-bottom:0.25rem; }
+.intel-icon { font-size:0.85rem; }
+.intel-source { font-weight:600; color:var(--bright); font-size:0.8rem; }
+.intel-relevance {
+    display:inline-block; padding:0.05rem 0.35rem; border-radius:3px;
+    font-size:0.65rem; font-weight:700; text-transform:uppercase; letter-spacing:0.03em;
+}
+.intel-time { margin-left:auto; color:var(--muted); font-size:0.7rem; }
+.intel-title { color:var(--fg); font-size:0.85rem; font-weight:500; margin-bottom:0.2rem; }
+.intel-analysis { color:var(--muted); font-size:0.78rem; line-height:1.4; margin-bottom:0.25rem; }
+.intel-meta { display:flex; align-items:center; gap:0.7rem; flex-wrap:wrap; }
+.intel-urls { font-size:0.7rem; color:var(--muted); }
+.intel-link { color:#58a6ff; text-decoration:none; font-size:0.7rem; }
+.intel-link:hover { text-decoration:underline; }
+.intel-followup {
+    font-size:0.73rem; color:#3fb950; font-style:italic;
+}
+/* Staging Queue */
+.staging-list { display:flex; flex-direction:column; gap:0.4rem; padding:0.5rem; }
+.staging-card {
+    background:var(--card-bg); border:1px solid var(--border); border-radius:6px;
+    padding:0.6rem 0.7rem; transition:border-color 0.15s;
+}
+.staging-card:hover { border-color:var(--accent); }
+.staging-header { display:flex; align-items:center; gap:0.5rem; margin-bottom:0.3rem; }
+.staging-priority {
+    display:inline-block; padding:0.05rem 0.35rem; border-radius:3px;
+    font-size:0.65rem; font-weight:700; text-transform:uppercase; letter-spacing:0.03em;
+}
+.staging-target { font-size:0.8rem; color:var(--muted); }
+.staging-id { font-size:0.7rem; color:var(--muted); font-family:var(--mono); }
+.staging-time { margin-left:auto; color:var(--muted); font-size:0.7rem; }
+.staging-title { color:var(--bright); font-size:0.85rem; font-weight:500; margin-bottom:0.15rem; }
+.staging-desc { color:var(--muted); font-size:0.78rem; line-height:1.4; }
+.section-count {
+    display:inline-block; background:var(--accent); color:#000; border-radius:10px;
+    padding:0 0.4rem; font-size:0.7rem; font-weight:700; margin-left:0.4rem;
+}
+/* Refresh pulse animation */
+@keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:0.3; } }
+.refreshing .health-dot { animation:pulse 0.6s ease-in-out; }
+
+/* Responsive */
+@media (max-width: 900px) {
+    .section-row { grid-template-columns:1fr; }
+    .coord-grid { grid-template-columns:1fr; }
+}
+</style>
+</head>
+<body>
+    <header>
+        <h1>\u2694 War Room</h1>
+        <span class="meta">__PROJECT__ \u2022 <span id="generated">__GENERATED__</span></span>
+        <div id="conn-lost" class="conn-lost">\u26a0 Connection lost</div>
+    </header>
+
+    <div id="slot-health">__HEALTH_BAR__</div>
+
+    <div class="section-row">
+        <div id="slot-coordinators">__COORDINATORS__</div>
+        <div id="slot-agents">__AGENTS__</div>
+    </div>
+
+    <div id="slot-staging">__STAGING__</div>
+
+    <div id="slot-active-tasks">__ACTIVE_TASKS__</div>
+
+    <div id="slot-triggers">__TRIGGERS__</div>
+
+    <div id="slot-research">__RESEARCH__</div>
+
+    <div id="slot-activity">__ACTIVITY__</div>
+
+    <footer class="footer">
+        Generated by sfs_events.py \u2022 __REFRESH_LABEL__
+    </footer>
+
+    <script>
+    let currentFeedView = 'intel';
+    const collapsedSections = {};
+
+    function toggleFeed(view) {
+        currentFeedView = view;
+        const intelEl = document.getElementById('feed-intel');
+        const debugEl = document.getElementById('feed-debug');
+        if (intelEl) intelEl.style.display = view === 'intel' ? '' : 'none';
+        if (debugEl) debugEl.style.display = view === 'debug' ? '' : 'none';
+        document.querySelectorAll('.toggle-btn').forEach(btn => {
+            btn.classList.toggle('active', btn.dataset.view === view);
+        });
+    }
+
+    function toggleSection(panelId) {
+        collapsedSections[panelId] = !collapsedSections[panelId];
+        applyCollapsed();
+    }
+
+    function applyCollapsed() {
+        document.querySelectorAll('.section[id^="panel-"]').forEach(panel => {
+            const id = panel.id;
+            const btn = panel.querySelector('.collapse-btn');
+            if (collapsedSections[id]) {
+                panel.classList.add('collapsed');
+                if (btn) btn.textContent = '+';
+            } else {
+                panel.classList.remove('collapsed');
+                if (btn) btn.textContent = '\u2212';
+            }
+        });
+    }
+
+    function injectCollapseButtons() {
+        document.querySelectorAll('.section[id^="panel-"]').forEach(panel => {
+            const title = panel.querySelector('.section-title');
+            if (!title || title.querySelector('.collapse-btn')) return;
+            const btn = document.createElement('button');
+            btn.className = 'collapse-btn';
+            btn.textContent = collapsedSections[panel.id] ? '+' : '\u2212';
+            btn.onclick = function(e) { e.stopPropagation(); toggleSection(panel.id); };
+            title.style.position = 'relative';
+            title.appendChild(btn);
+        });
+        applyCollapsed();
+    }
+
+    document.addEventListener('DOMContentLoaded', injectCollapseButtons);
+    </script>
+
+    __POLL_SCRIPT__
+</body>
+</html>"""
+
+
+_POLL_SCRIPT = """<script>
+(function() {
+    const POLL_MS = 5000;
+    const connLost = document.getElementById('conn-lost');
+    const body = document.body;
+    let failures = 0;
+
+    async function refresh() {
+        try {
+            body.classList.add('refreshing');
+            const resp = await fetch('/data');
+            if (!resp.ok) throw new Error('HTTP ' + resp.status);
+            const data = await resp.json();
+
+            document.getElementById('slot-health').innerHTML = data.health_bar;
+            document.getElementById('slot-coordinators').innerHTML = data.coordinators;
+            document.getElementById('slot-agents').innerHTML = data.agents;
+            document.getElementById('slot-staging').innerHTML = data.staging;
+            document.getElementById('slot-active-tasks').innerHTML = data.active_tasks;
+            document.getElementById('slot-triggers').innerHTML = data.triggers;
+            document.getElementById('slot-research').innerHTML = data.research;
+            document.getElementById('slot-activity').innerHTML = data.activity;
+            toggleFeed(currentFeedView);
+            injectCollapseButtons();
+            document.getElementById('generated').textContent = data.generated;
+
+            connLost.classList.remove('visible');
+            failures = 0;
+        } catch(e) {
+            failures++;
+            if (failures >= 2) {
+                connLost.classList.add('visible');
+            }
+        } finally {
+            body.classList.remove('refreshing');
+        }
+    }
+
+    setInterval(refresh, POLL_MS);
+})();
+</script>"""
+
+
+# -- Dashboard generation + serve ---------------------------------------------
+
+
+def _generate_dashboard_html(
+    data: dict | None,
+    *,
+    live: bool = False,
+) -> str:
+    """Render complete bus ops dashboard from collected data."""
+    if data is None:
+        return _BUS_ERROR_TEMPLATE
+
+    project = Path.cwd().name
+    generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    html = _BUS_DASHBOARD_TEMPLATE
+    html = html.replace("__PROJECT__", _html_esc(project))
+    html = html.replace("__GENERATED__", generated)
+    html = html.replace("__HEALTH_BAR__", _render_health_bar(data))
+    html = html.replace("__COORDINATORS__", _render_coordinators(data))
+    html = html.replace("__AGENTS__", _render_agents(data))
+    html = html.replace("__STAGING__", _render_staging())
+    html = html.replace("__ACTIVE_TASKS__", _render_active_tasks(data))
+    html = html.replace("__TRIGGERS__", _render_triggers(data))
+    html = html.replace("__RESEARCH__", _render_research(data))
+    html = html.replace("__ACTIVITY__", _render_activity_feed(data))
+
+    if live:
+        html = html.replace("__POLL_SCRIPT__", _POLL_SCRIPT)
+        html = html.replace("__REFRESH_LABEL__", "Live \u2022 updates every 5s")
+    else:
+        html = html.replace("__POLL_SCRIPT__", "")
+        html = html.replace("__REFRESH_LABEL__", "Refresh to update")
+
+    return html
+
+
+def _dashboard_impl(
+    auto_open: bool = True,
+    *,
+    socket_path: str = DEFAULT_SOCKET,
+) -> tuple[dict, dict]:
+    """Generate static bus ops dashboard. CLI: dashboard, MCP: dashboard."""
+    start_ms = time.time() * 1000
+
+    data = _collect_dashboard_data(socket_path)
+    html = _generate_dashboard_html(data, live=False)
+
+    _BUS_DASHBOARD_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _BUS_DASHBOARD_PATH.write_text(html, encoding="utf-8")
+
+    if auto_open:
+        import webbrowser
+        webbrowser.open(f"file://{_BUS_DASHBOARD_PATH}")
+
+    latency_ms = time.time() * 1000 - start_ms
+    _log("INFO", "dashboard", f"html={_BUS_DASHBOARD_PATH}")
+
+    result = {
+        "html_file": str(_BUS_DASHBOARD_PATH),
+        "data_sources": 9 if data else 0,
+        "agents": len(data["agents"].get("agents", [])) if data else 0,
+        "triggers": len(data["triggers"].get("triggers", [])) if data else 0,
+    }
+    metrics = {"status": "success", "latency_ms": round(latency_ms, 2)}
+    return result, metrics
+
+
+def _dashboard_serve_impl(
+    port: int = _DASHBOARD_PORT,
+    *,
+    socket_path: str = DEFAULT_SOCKET,
+) -> None:
+    """Start live dashboard HTTP server. CLI: dashboard serve."""
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+
+    class DashboardHandler(BaseHTTPRequestHandler):
+        """Serves dashboard HTML and JSON data API."""
+
+        def do_GET(self) -> None:
+            if self.path == "/" or self.path == "":
+                self._serve_html()
+            elif self.path == "/data":
+                self._serve_data()
+            elif self.path == "/health":
+                self._respond(200, "application/json", b'{"ok":true}')
+            else:
+                self._respond(404, "text/plain", b"Not found")
+
+        def _serve_html(self) -> None:
+            data = _collect_dashboard_data(socket_path)
+            html = _generate_dashboard_html(data, live=True)
+            self._respond(200, "text/html; charset=utf-8", html.encode("utf-8"))
+
+        def _serve_data(self) -> None:
+            data = _collect_dashboard_data(socket_path)
+            if data is None:
+                self._respond(503, "application/json", b'{"error":"bus offline"}')
+                return
+            panels = _render_all_panels(data)
+            body = json.dumps(panels).encode("utf-8")
+            self._respond(200, "application/json", body)
+
+        def _respond(self, code: int, content_type: str, body: bytes) -> None:
+            self.send_response(code)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-cache, no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, fmt: str, *args: object) -> None:
+            # Suppress default stderr logging; use our TSV logger
+            _log("TRACE", "dashboard_http", fmt % args)
+
+    server = HTTPServer(("127.0.0.1", port), DashboardHandler)
+    _log("INFO", "dashboard_serve", f"port={port}")
+    print(f"\u2694  War Room live at http://127.0.0.1:{port}", file=sys.stderr)
+    print(f"   Press Ctrl+C to stop", file=sys.stderr)
+
+    import webbrowser
+    webbrowser.open(f"http://127.0.0.1:{port}")
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nShutting down dashboard server...", file=sys.stderr)
+        server.shutdown()
+
+
+
+# =============================================================================
 # CLI INTERFACE
 # =============================================================================
 
@@ -1645,10 +3814,65 @@ Examples:
     p_aret.add_argument("-A", "--agent", required=True, help="Agent name or ID")
     p_aret.add_argument("-s", "--socket", default=DEFAULT_SOCKET)
 
+    # stage
+    p_stage = sub.add_parser("stage", help="Stage a task for team execution")
+    p_stage.add_argument("-t", "--title", required=True, help="Task title")
+    p_stage.add_argument("-d", "--description", default="", help="Task description")
+    p_stage.add_argument(
+        "-p", "--priority", default="medium",
+        choices=list(_VALID_PRIORITIES), help="Priority",
+    )
+    p_stage.add_argument(
+        "-T", "--target", default="fix",
+        choices=list(_VALID_TARGETS), help="Target coordinator",
+    )
+
+    # staged
+    p_staged = sub.add_parser("staged", help="List staged tasks")
+    p_staged.add_argument(
+        "-a", "--all", action="store_true", dest="include_released",
+        help="Include released and pulled tasks",
+    )
+
+    # refine
+    p_refine = sub.add_parser("refine", help="Refine a staged task")
+    p_refine.add_argument("task_id", help="Task ID to refine")
+    p_refine.add_argument("-t", "--title", default="", help="New title")
+    p_refine.add_argument("-d", "--description", default="", help="New description")
+    p_refine.add_argument("-p", "--priority", default="", help="New priority")
+    p_refine.add_argument("-T", "--target", default="", help="New target coordinator")
+
+    # release
+    p_release = sub.add_parser("release", help="Release staged task to coordinator")
+    p_release.add_argument("task_id", help="Task ID to release")
+    p_release.add_argument("-s", "--socket", default=DEFAULT_SOCKET)
+
+    # pull
+    p_pull = sub.add_parser("pull", help="Pull staged task for direct work")
+    p_pull.add_argument("task_id", help="Task ID to pull")
+
+    # drop
+    p_drop = sub.add_parser("drop", help="Drop (cancel) a staged task")
+    p_drop.add_argument("task_id", help="Task ID to drop")
+
+    # dashboard
+    p_dash = sub.add_parser("dashboard", help="Generate bus ops dashboard")
+    p_dash.add_argument("mode", nargs="?", default="static", choices=["static", "serve"],
+                        help="static (default) or serve (live HTTP server)")
+    p_dash.add_argument("-n", "--no-open", action="store_true", help="Do not open browser")
+    p_dash.add_argument("-p", "--port", type=int, default=_DASHBOARD_PORT,
+                        help=f"Port for serve mode (default {_DASHBOARD_PORT})")
+    p_dash.add_argument("-s", "--socket", default=DEFAULT_SOCKET)
+
     # mcp-stdio
     sub.add_parser("mcp-stdio", help="Run as MCP server")
 
     args = parser.parse_args()
+
+    # MCP dispatch — must come before any stdin reads
+    if args.command == "mcp-stdio":
+        _run_mcp()
+        sys.exit(0)
 
     # stdin support — pipe JSON to publish: echo '{"channel":"x","payload":{}}' | sfs_events.py
     if not args.command and not sys.stdin.isatty():
@@ -1670,10 +3894,7 @@ Examples:
                 sys.exit(1)
 
     try:
-        if args.command == "mcp-stdio":
-            _run_mcp()
-
-        elif args.command == "serve":
+        if args.command == "serve":
             if args.background:
                 _daemonize(args.socket)
             else:
@@ -1808,6 +4029,47 @@ Examples:
                 socket_path=args.socket,
             )
             print(json.dumps(result, indent=2))
+
+        elif args.command == "stage":
+            result, _ = _stage_impl(
+                args.title, args.description, args.priority, args.target,
+            )
+            print(json.dumps(result, indent=2, default=str))
+
+        elif args.command == "staged":
+            result, _ = _staged_impl(include_released=args.include_released)
+            print(json.dumps(result, indent=2, default=str))
+
+        elif args.command == "refine":
+            result, _ = _refine_impl(
+                args.task_id, args.title, args.description, args.priority, args.target,
+            )
+            print(json.dumps(result, indent=2, default=str))
+
+        elif args.command == "release":
+            result, _ = _release_impl(args.task_id, socket_path=args.socket)
+            print(json.dumps(result, indent=2, default=str))
+
+        elif args.command == "pull":
+            result, _ = _pull_impl(args.task_id)
+            print(json.dumps(result, indent=2, default=str))
+
+        elif args.command == "drop":
+            result, _ = _drop_impl(args.task_id)
+            print(json.dumps(result, indent=2, default=str))
+
+        elif args.command == "dashboard":
+            if args.mode == "serve":
+                _dashboard_serve_impl(
+                    port=args.port,
+                    socket_path=args.socket,
+                )
+            else:
+                result, metrics = _dashboard_impl(
+                    auto_open=not args.no_open,
+                    socket_path=args.socket,
+                )
+                print(json.dumps(result, indent=2))
 
         else:
             parser.print_help()
@@ -1956,13 +4218,14 @@ def _run_mcp():
     # MCP for _trigger_add_impl
     @mcp.tool()
     def trigger_add(trigger_type: str, channel: str, config: str = "{}") -> str:
-        """Add a file or URL trigger that publishes events to a channel.
+        """Add a file, URL, or schedule trigger that publishes events to a channel.
 
         Args:
-            trigger_type: "file" (watchdog) or "url" (HTTP polling)
+            trigger_type: "file" (watchdog), "url" (HTTP polling), or "schedule" (fixed interval)
             channel: Target channel (auto-scoped to project, use @ for absolute)
             config: JSON config — file: {"path": "/dir", "recursive": true, "events": ["modified","created"]}
                     url: {"url": "https://...", "interval_seconds": 300}
+                    schedule: {"interval_seconds": 300, "label": "health-tick"}
 
         Returns:
             JSON with trigger_id, type, channel
@@ -2067,6 +4330,119 @@ def _run_mcp():
             JSON confirmation with agent_id and retired status
         """
         result, _ = _agent_retire_impl(agent)
+        return json.dumps(result, indent=2)
+
+    # MCP for _stage_impl
+    @mcp.tool()
+    def stage(
+        title: str, description: str = "", priority: str = "medium", target: str = "fix"
+    ) -> str:
+        """Stage a task for team execution.
+
+        Args:
+            title: Short task title
+            description: Detailed description (becomes coordinator prompt on release)
+            priority: Task priority (critical, high, medium, low)
+            target: Target coordinator (review, fix, docs, research)
+
+        Returns:
+            JSON with staged task details
+        """
+        result, _ = _stage_impl(title, description, priority, target)
+        return json.dumps(result, indent=2, default=str)
+
+    # MCP for _staged_impl
+    @mcp.tool()
+    def staged(include_released: bool = False) -> str:
+        """List staged tasks sorted by priority.
+
+        Args:
+            include_released: Also show released and pulled tasks
+
+        Returns:
+            JSON list of staged tasks
+        """
+        result, _ = _staged_impl(include_released=include_released)
+        return json.dumps(result, indent=2, default=str)
+
+    # MCP for _refine_impl
+    @mcp.tool()
+    def refine(
+        task_id: str,
+        title: str = "",
+        description: str = "",
+        priority: str = "",
+        target: str = "",
+    ) -> str:
+        """Refine a staged task.
+
+        Args:
+            task_id: ID of the staged task
+            title: New title (empty to keep current)
+            description: New description (empty to keep current)
+            priority: New priority (empty to keep current)
+            target: New target coordinator (empty to keep current)
+
+        Returns:
+            JSON with updated task details
+        """
+        result, _ = _refine_impl(task_id, title, description, priority, target)
+        return json.dumps(result, indent=2, default=str)
+
+    # MCP for _release_impl
+    @mcp.tool()
+    def release(task_id: str) -> str:
+        """Release a staged task to its target coordinator for execution.
+
+        Args:
+            task_id: ID of the staged task to release
+
+        Returns:
+            JSON with release details including correlation_id
+        """
+        result, _ = _release_impl(task_id)
+        return json.dumps(result, indent=2, default=str)
+
+    # MCP for _pull_impl
+    @mcp.tool()
+    def pull(task_id: str) -> str:
+        """Pull a staged task for direct work (exception — team execution is default).
+
+        Args:
+            task_id: ID of the staged task to pull
+
+        Returns:
+            JSON with pulled task details
+        """
+        result, _ = _pull_impl(task_id)
+        return json.dumps(result, indent=2, default=str)
+
+    # MCP for _drop_impl
+    @mcp.tool()
+    def drop(task_id: str) -> str:
+        """Drop (cancel) a staged task.
+
+        Args:
+            task_id: ID of the staged task to drop
+
+        Returns:
+            JSON with dropped task details
+        """
+        result, _ = _drop_impl(task_id)
+        return json.dumps(result, indent=2, default=str)
+
+    # MCP for _dashboard_impl
+    @mcp.tool()
+    def dashboard(auto_open: bool = False) -> str:
+        """Generate bus ops dashboard HTML.
+
+        Args:
+            auto_open: Open in browser after generation
+
+        Returns:
+            JSON with html_file path and dashboard metadata
+        """
+        result, _ = _dashboard_impl(auto_open=auto_open)
         return json.dumps(result, indent=2)
 
     print("Sanctum event bus MCP server starting...", file=sys.stderr)

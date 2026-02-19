@@ -34,8 +34,8 @@ from typing import Any
 # LOGGING
 # =============================================================================
 _LEVELS = {"TRACE": 5, "DEBUG": 10, "INFO": 20, "WARN": 30, "ERROR": 40, "FATAL": 50}
-_THRESHOLD = _LEVELS.get(os.environ.get("SFA_LOG_LEVEL", "INFO"), 20)
-_LOG_DIR = os.environ.get("SFA_LOG_DIR", "")
+_THRESHOLD = _LEVELS.get(os.environ.get("SFB_LOG_LEVEL", "INFO"), 20)
+_LOG_DIR = os.environ.get("SFB_LOG_DIR", "")
 _SCRIPT = Path(__file__).stem
 _LOG = (
     Path(_LOG_DIR) / f"{_SCRIPT}_log.tsv"
@@ -85,10 +85,17 @@ CONFIG = {
 # =============================================================================
 
 def _get_api_key() -> str:
-    """Get API key from environment."""
+    """Get API key from .secrets file or environment."""
     key = os.environ.get("CONTEXT7_API_KEY")
     if not key:
-        raise Exception("Missing CONTEXT7_API_KEY environment variable")
+        secrets_path = Path(__file__).parent / ".secrets"
+        if secrets_path.exists():
+            for line in secrets_path.read_text().splitlines():
+                if line.startswith("export CONTEXT7_API_KEY="):
+                    key = line.split("=", 1)[1].strip()
+                    break
+    if not key:
+        raise Exception("Missing CONTEXT7_API_KEY — set in environment or scripts/.secrets")
     return key
 
 

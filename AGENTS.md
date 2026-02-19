@@ -244,8 +244,21 @@ See SPEC_SFA.md Principle 10 for the full semantic versioning spec.
 - **sfb-reviewer** — read-only subagent that audits scripts and reports findings in DR/RFC format. **Must use sfl_test_gen** for test generation tasks.
 - **python-expert** — read-only subagent for Python expertise, code review, and pattern guidance
 
+### Session Continuity via Passdowns
+To maintain context across sessions, check the current passdown note at the start of each session:
+
+```bash
+# View current passdown (shows pending/active tasks + current passdown)
+./scripts/sft_track.py status
+
+# Or use the MCP tool
+track_status
+```
+
+The passdown contains session notes, debugging context, and work-in-progress state. Always review it before starting work to understand the current context.
+
 ## Environment Notes
-- macOS (darwin), user john
+- macOS (darwin), user sfb
 - Passwordless sudo enabled
 - `uv` (Astral) is the package runner — not pip, not poetry
 - Scripts live in `scripts/`

@@ -19,7 +19,7 @@ General-purpose CLI utilities, MCP tools, unix-style commands. The workhorses of
 | `sft_file_write.py` | `fw` | 1.1.0 | Destructive file operations | write, create, cp, mv, rm + backups |
 | `sft_duckdb.py` | `duckdb` | 1.0.0 | Natural language SQL queries | query, schema, AI-assisted |
 | `sft_jq.py` | `jq` | 1.0.0 | Natural language JSON processing | generate, query, jq command builder |
-| `sft_chrome.py` | — | 1.1.0 | Chrome browser automation | 22 functions, 2 profiles (john, sandbox) |
+| `sft_chrome.py` | — | 1.1.0 | Chrome browser automation | 22 functions, 2 profiles (default, sandbox) |
 | `sft_clipboard.py` | — | 1.1.0 | Clipboard operations | read, write |
 | `sft_x.py` | — | 2.1.0 | Perplexity AI search | search |
 

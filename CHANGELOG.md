@@ -1,4 +1,4 @@
-# CHANGELOG — SFA (Syne Function Arsenal)
+# CHANGELOG — SFB (Single-File Bench)
 
 Changes tracked as **DR** (Discrepancy Report — bug/error) and **RFC** (Request for Change — new/changed functionality).
 

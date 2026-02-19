@@ -37,8 +37,8 @@ import websocket
 # LOGGING
 # =============================================================================
 _LEVELS = {"TRACE": 5, "DEBUG": 10, "INFO": 20, "WARN": 30, "ERROR": 40, "FATAL": 50}
-_THRESHOLD = _LEVELS.get(os.environ.get("SFA_LOG_LEVEL", "INFO"), 20)
-_LOG_DIR = os.environ.get("SFA_LOG_DIR", "")
+_THRESHOLD = _LEVELS.get(os.environ.get("SFB_LOG_LEVEL", "INFO"), 20)
+_LOG_DIR = os.environ.get("SFB_LOG_DIR", "")
 _SCRIPT = Path(__file__).stem
 _LOG = (
     Path(_LOG_DIR) / f"{_SCRIPT}_log.tsv"
@@ -101,16 +101,34 @@ EXPOSED = [
     "dialog",
     "drag",
     "emulate",
+    "trail_start",
+    "trail_stop",
+    "trail_status",
+    "headless_start",
+    "headless_stop",
+    "headless_list",
+    "headless_action",
+    "replay",
 ]  # CLI + MCP — both interfaces
 
 # When to use which profile:
-#   john    - User's main browser for debugging and collaborative work
+# default - User's main browser for debugging and collaborative work
 #   sandbox - Anonymous testing, CDP automation, no Google auth
 PROFILES = {
     "sandbox": {"port": 9220, "desc": "Anonymous CDP testing (no Google auth)"},
-    "john": {"port": 9221, "desc": "john.w.sampson@gmail.com"},
+    "default": {"port": 9221, "desc": "user@example.com"},
 }
-DEFAULT_PORT = PROFILES["john"]["port"]  # For CDPClient class default only
+DEFAULT_PORT = PROFILES["default"]["port"]  # For CDPClient class default only
+
+# Headless session port range (avoids collisions with named profiles)
+_HEADLESS_PORT_START = 9230
+_HEADLESS_PORT_END = 9250
+_HEADLESS_SESSIONS: dict[str, dict] = {}  # name -> {port, process, profile_dir}
+
+# Trail state — module-level singleton
+_TRAIL_DIR: Path | None = None  # Set by chrome_trail_start, cleared by chrome_trail_stop
+_TRAIL_STEP: int = 0
+_TRAIL_RECORDING: list[dict] = []  # For save/replay — records actions when trail is active
 
 
 def get_chrome_path():
@@ -235,11 +253,350 @@ def launch_chrome(profile: str, port: int = None):
     )
 
 
+# =============================================================================
+# TRAIL SYSTEM — auto-screenshot + action recording
+# =============================================================================
+
+def _trail_capture(action: str, profile: str, page_idx: int = 0, detail: str = ""):
+    """If a trail is active, capture a screenshot and record the action."""
+    global _TRAIL_STEP
+    if _TRAIL_DIR is None:
+        return
+    _TRAIL_STEP += 1
+    fname = f"{_TRAIL_STEP:03d}_{action}.png"
+    fpath = _TRAIL_DIR / fname
+
+    try:
+        port = _resolve_port(profile)
+        ext = Extractor(port)
+        if ext.connect(page_idx):
+            result = ext.send_command("Page.captureScreenshot")
+            image_bytes = base64.b64decode(result["data"])
+            fpath.write_bytes(image_bytes)
+            ext.close()
+    except Exception:
+        pass  # Trail capture never crashes the main flow
+
+    # Record for replay
+    _TRAIL_RECORDING.append({
+        "step": _TRAIL_STEP,
+        "action": action,
+        "detail": detail,
+        "screenshot": fname,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    })
+
+
+def chrome_trail_start(name: str = "") -> tuple[bool, str]:
+    """Start a screenshot trail. Every action auto-captures a screenshot.
+
+    Args:
+        name: Trail name (default: timestamp-based)
+
+    Returns:
+        (success, trail_directory_path)
+    """
+    global _TRAIL_DIR, _TRAIL_STEP, _TRAIL_RECORDING
+    if not name:
+        name = datetime.now().strftime("%Y%m%d_%H%M%S")
+    trail_dir = Path("data/chrome_trails") / name
+    trail_dir.mkdir(parents=True, exist_ok=True)
+    _TRAIL_DIR = trail_dir
+    _TRAIL_STEP = 0
+    _TRAIL_RECORDING = []
+    _log("INFO", "trail_start", f"trail={name} dir={trail_dir}")
+    return True, str(trail_dir)
+
+
+def chrome_trail_stop() -> tuple[bool, dict]:
+    """Stop the active trail. Saves the action log as trail.json.
+
+    Returns:
+        (success, summary_dict)
+    """
+    global _TRAIL_DIR, _TRAIL_STEP, _TRAIL_RECORDING
+    if _TRAIL_DIR is None:
+        return False, {"error": "No active trail"}
+
+    # Save action log
+    log_path = _TRAIL_DIR / "trail.json"
+    with open(log_path, "w") as f:
+        json.dump({"steps": _TRAIL_RECORDING, "total": _TRAIL_STEP}, f, indent=2)
+
+    summary = {
+        "trail_dir": str(_TRAIL_DIR),
+        "total_steps": _TRAIL_STEP,
+        "log_file": str(log_path),
+    }
+    _log("INFO", "trail_stop", f"steps={_TRAIL_STEP} dir={_TRAIL_DIR}")
+    _TRAIL_DIR = None
+    _TRAIL_STEP = 0
+    _TRAIL_RECORDING = []
+    return True, summary
+
+
+def chrome_trail_status() -> dict:
+    """Check if a trail is active and its current state."""
+    if _TRAIL_DIR is None:
+        return {"active": False}
+    return {
+        "active": True,
+        "trail_dir": str(_TRAIL_DIR),
+        "steps_captured": _TRAIL_STEP,
+    }
+
+
+# =============================================================================
+# HEADLESS SESSIONS — parallel Chrome instances via --headless=new
+# =============================================================================
+
+def _find_free_headless_port() -> int:
+    """Find next available port in the headless range."""
+    used_ports = {s["port"] for s in _HEADLESS_SESSIONS.values()}
+    for port in range(_HEADLESS_PORT_START, _HEADLESS_PORT_END):
+        if port not in used_ports:
+            # Check if actually free
+            try:
+                httpx.get(f"http://localhost:{port}/json", timeout=0.5)
+                continue  # Something is already on this port
+            except Exception:
+                return port
+    assert False, f"No free ports in range {_HEADLESS_PORT_START}-{_HEADLESS_PORT_END}"
+
+
+def chrome_headless_start(name: str = "") -> tuple[bool, dict, str]:
+    """Start a headless Chrome session. Returns (success, session_info, error).
+
+    Args:
+        name: Session name (default: auto-generated)
+    """
+    if not name:
+        name = f"headless_{len(_HEADLESS_SESSIONS) + 1}"
+
+    if name in _HEADLESS_SESSIONS:
+        return False, {}, f"Session '{name}' already exists"
+
+    port = _find_free_headless_port()
+    profile_dir = Path(tempfile.mkdtemp(prefix=f"chrome_headless_{name}_"))
+
+    cmd = [
+        CHROME_PATH,
+        "--headless=new",
+        f"--remote-debugging-port={port}",
+        f"--user-data-dir={profile_dir}",
+        "--remote-allow-origins=*",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-gpu",
+        "--no-sandbox",
+    ]
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except (FileNotFoundError, OSError) as e:
+        return False, {}, f"Failed to launch headless Chrome: {e}"
+
+    # Wait for it to come up
+    for _ in range(15):
+        try:
+            httpx.get(f"http://localhost:{port}/json", timeout=1.0)
+            break
+        except Exception:
+            time.sleep(0.5)
+    else:
+        proc.kill()
+        return False, {}, "Headless Chrome failed to start within timeout"
+
+    _HEADLESS_SESSIONS[name] = {
+        "port": port,
+        "process": proc,
+        "profile_dir": str(profile_dir),
+        "pid": proc.pid,
+    }
+
+    info = {"name": name, "port": port, "pid": proc.pid, "profile_dir": str(profile_dir)}
+    _log("INFO", "headless_start", f"name={name} port={port} pid={proc.pid}")
+    return True, info, ""
+
+
+def chrome_headless_stop(name: str) -> tuple[bool, str]:
+    """Stop a headless Chrome session.
+
+    Args:
+        name: Session name to stop
+    """
+    if name not in _HEADLESS_SESSIONS:
+        return False, f"Session '{name}' not found. Active: {list(_HEADLESS_SESSIONS.keys())}"
+
+    session = _HEADLESS_SESSIONS.pop(name)
+    try:
+        proc = session["process"]
+        proc.terminate()
+        proc.wait(timeout=5)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+    # Clean up temp profile
+    try:
+        shutil.rmtree(session["profile_dir"], ignore_errors=True)
+    except Exception:
+        pass
+
+    _log("INFO", "headless_stop", f"name={name}")
+    return True, f"Session '{name}' stopped"
+
+
+def chrome_headless_list() -> list[dict]:
+    """List all active headless sessions."""
+    result = []
+    for name, session in _HEADLESS_SESSIONS.items():
+        alive = session["process"].poll() is None
+        result.append({
+            "name": name,
+            "port": session["port"],
+            "pid": session["pid"],
+            "alive": alive,
+        })
+    return result
+
+
+def chrome_headless_action(name: str, action: str, **kwargs) -> tuple[bool, Any, str]:
+    """Execute a chrome action against a headless session by name.
+
+    Maps the session name to its port, then delegates to the standard chrome_* functions.
+
+    Args:
+        name: Headless session name
+        action: Action name (goto, click, fill, look, read, js, etc.)
+        **kwargs: Arguments passed to the action function
+    """
+    if name not in _HEADLESS_SESSIONS:
+        return False, None, f"Session '{name}' not found"
+
+    session = _HEADLESS_SESSIONS[name]
+    port = session["port"]
+
+    # Map action to function, injecting port via a temporary profile entry
+    temp_profile = f"_headless_{name}"
+    PROFILES[temp_profile] = {"port": port, "desc": f"Headless: {name}"}
+
+    try:
+        action_map = {
+            "goto": chrome_goto,
+            "click": chrome_click,
+            "fill": chrome_fill,
+            "look": chrome_look,
+            "read": chrome_read,
+            "js": chrome_js,
+            "key": chrome_key,
+            "wait": chrome_wait,
+            "hover": chrome_hover,
+            "scroll": chrome_scroll,
+            "survey": chrome_survey,
+            "find": chrome_find,
+            "do": chrome_do,
+        }
+        assert action in action_map, f"Unknown action '{action}'. Available: {list(action_map.keys())}"
+        fn = action_map[action]
+        # Inject profile into kwargs
+        kwargs["profile"] = temp_profile
+        return fn(**kwargs)
+    finally:
+        PROFILES.pop(temp_profile, None)
+
+
+# =============================================================================
+# SAVE/REPLAY — record and replay action scripts
+# =============================================================================
+
+def chrome_replay(script_path: str, profile: str, delay: float = 0.5) -> tuple[bool, dict, str]:
+    """Replay a saved trail script (trail.json) against a browser profile.
+
+    Args:
+        script_path: Path to trail.json file
+        profile: Target profile to replay against
+        delay: Seconds between actions (default 0.5)
+
+    Returns:
+        (success, results_dict, error)
+    """
+    script_file = Path(script_path)
+    assert script_file.exists(), f"Script file not found: {script_path}"
+
+    with open(script_file) as f:
+        script = json.load(f)
+
+    steps = script.get("steps", [])
+    results = []
+    failed = 0
+
+    for step in steps:
+        action = step.get("action", "")
+        detail = step.get("detail", "")
+
+        if not detail:
+            results.append({"step": step["step"], "action": action, "status": "skipped", "reason": "no detail"})
+            continue
+
+        try:
+            action_args = json.loads(detail)
+        except (json.JSONDecodeError, TypeError):
+            results.append({"step": step["step"], "action": action, "status": "skipped", "reason": "unparseable detail"})
+            continue
+
+        # Map action to function
+        action_map = {
+            "goto": chrome_goto,
+            "click": chrome_click,
+            "fill": chrome_fill,
+            "js": chrome_js,
+            "key": chrome_key,
+            "wait": chrome_wait,
+            "hover": chrome_hover,
+            "scroll": chrome_scroll,
+            "do": chrome_do,
+        }
+
+        fn = action_map.get(action)
+        if not fn:
+            results.append({"step": step["step"], "action": action, "status": "skipped", "reason": "unknown action"})
+            continue
+
+        try:
+            action_args["profile"] = profile
+            result = fn(**action_args)
+            success = result[0] if isinstance(result, tuple) else True
+            results.append({"step": step["step"], "action": action, "status": "ok" if success else "fail"})
+            if not success:
+                failed += 1
+        except Exception as e:
+            results.append({"step": step["step"], "action": action, "status": "error", "error": str(e)})
+            failed += 1
+
+        time.sleep(delay)
+
+    summary = {
+        "total_steps": len(steps),
+        "executed": len(results),
+        "failed": failed,
+        "results": results,
+    }
+    return failed == 0, summary, "" if failed == 0 else f"{failed} step(s) failed"
+
+
 def chrome_ensure(profile: str) -> tuple[bool, dict, str]:
     """Ensure Chrome is running for profile, launch if needed, focus, return status.
 
     Args:
-        profile: REQUIRED. One of: "john" or "sandbox"
+        profile: REQUIRED. One of: "default" or "sandbox"
 
     Returns:
         (success, status_dict, message)
@@ -382,12 +739,12 @@ def chrome_kill(target: str) -> str:
     """Kill Chrome instance(s). REQUIRES explicit target - no defaults.
 
     Args:
-        target: REQUIRED. One of: "john", "sandbox", or "all"
+        target: REQUIRED. One of: "default", "sandbox", or "all"
 
     Returns:
         Success/failure message after verification via chrome_status()
     """
-    valid_targets = ["john", "sandbox", "all"]
+    valid_targets = ["default", "sandbox", "all"]
     if target not in valid_targets:
         return f"ERROR: target must be one of {valid_targets}, got '{target}'"
 
@@ -705,8 +1062,9 @@ class Interactor(CDPClient):
         )
 
     def fill(self, selector: str, value: str):
-        self.evaluate_js(f"document.querySelector('{selector}').focus()")
-        self.evaluate_js(f"document.querySelector('{selector}').select()")
+        safe_selector = json.dumps(selector)
+        self.evaluate_js(f"document.querySelector({safe_selector}).focus()")
+        self.evaluate_js(f"document.querySelector({safe_selector}).select()")
 
         for char in value:
             self.send_command("Input.dispatchKeyEvent", {"type": "char", "text": char})
@@ -769,7 +1127,7 @@ def chrome_status() -> dict:
     """Get browser state for ALL profiles. Shows TRUTH - both CDP-controlled and not.
 
     Returns dict with:
-        - profiles: list of ALL profile states (john, sandbox)
+        - profiles: list of ALL profile states (default, sandbox)
         - uncontrolled: Chrome processes running but NOT under CDP control
         - summary: quick counts
 
@@ -1003,9 +1361,10 @@ def chrome_look(
 
         if selector:
             # Get element bounds for clip
+            safe_selector = json.dumps(selector)
             js = f"""
             (() => {{
-                const el = document.querySelector('{selector}');
+                const el = document.querySelector({safe_selector});
                 if (!el) return null;
                 const rect = el.getBoundingClientRect();
                 return {{
@@ -1062,6 +1421,7 @@ def chrome_goto(url: str, profile: str, page_idx: int = 0) -> tuple[bool, str]:
     try:
         nav.enable_domains()
         nav.goto(url)
+        _trail_capture("goto", profile, page_idx, json.dumps({"url": url}))
         return True, f"Navigated to {url}"
     except Exception as e:
         return False, str(e)
@@ -1105,6 +1465,7 @@ def chrome_click(selector: str, profile: str, page_idx: int = 0) -> tuple[bool, 
     try:
         inter.enable_domains()
         inter.click(selector)
+        _trail_capture("click", profile, page_idx, json.dumps({"selector": selector}))
         return True, f"Clicked {selector}"
     except Exception as e:
         return False, str(e)
@@ -1127,6 +1488,7 @@ def chrome_fill(
     try:
         inter.enable_domains()
         inter.fill(selector, value)
+        _trail_capture("fill", profile, page_idx, json.dumps({"selector": selector, "value": value}))
         return True, f"Filled {selector}"
     except Exception as e:
         return False, str(e)
@@ -1150,6 +1512,7 @@ def chrome_js(
     try:
         ext.enable_domains()
         result = ext.evaluate_js(expression)
+        _trail_capture("js", profile, page_idx, json.dumps({"expression": expression[:200]}))
         return True, result, ""
     except Exception as e:
         return False, None, str(e)
@@ -1170,6 +1533,7 @@ def chrome_key(key: str, profile: str, page_idx: int = 0) -> tuple[bool, str]:
     try:
         inter.enable_domains()
         inter.press_key(key)
+        _trail_capture("key", profile, page_idx, json.dumps({"key": key}))
         return True, f"Pressed {key}"
     except Exception as e:
         return False, str(e)
@@ -1241,10 +1605,13 @@ def chrome_wait(
             if text:
                 content = ext.evaluate_js("document.body.innerText")
                 if content and text in content:
+                    _trail_capture("wait", profile, page_idx, json.dumps({"text": text, "elapsed": f"{time.time() - start:.1f}s"}))
                     return True, f"Found text '{text}' after {time.time() - start:.1f}s"
             if selector:
-                found = ext.evaluate_js(f"!!document.querySelector('{selector}')")
+                safe_selector = json.dumps(selector)
+                found = ext.evaluate_js(f"!!document.querySelector({safe_selector})")
                 if found:
+                    _trail_capture("wait", profile, page_idx, json.dumps({"selector": selector, "elapsed": f"{time.time() - start:.1f}s"}))
                     return (
                         True,
                         f"Found selector '{selector}' after {time.time() - start:.1f}s",
@@ -1281,6 +1648,7 @@ def chrome_hover(selector: str, profile: str, page_idx: int = 0) -> tuple[bool, 
             "Input.dispatchMouseEvent",
             {"type": "mouseMoved", "x": center["x"], "y": center["y"]},
         )
+        _trail_capture("hover", profile, page_idx, json.dumps({"selector": selector}))
         return True, f"Hovered over {selector}"
     except Exception as e:
         return False, str(e)
@@ -1353,6 +1721,7 @@ def chrome_scroll(
                 "deltaY": delta_y,
             },
         )
+        _trail_capture("scroll", profile, page_idx, json.dumps({"direction": direction, "amount": amount, "selector": selector}))
         return True, f"Scrolled {direction} by {amount} ticks"
     except Exception as e:
         return False, str(e)
@@ -1891,11 +2260,11 @@ def chrome_dialog_auto(
                     return undefined;
                 }};
                 window.confirm = function(msg) {{ 
-                    console.log('[Syne] Auto-handled confirm:', msg, '-> {accept}');
+                    console.log('[Agent] Auto-handled confirm:', msg, '-> {accept}');
                     return {str(accept).lower()};
                 }};
                 window.prompt = function(msg, def) {{ 
-                    console.log('[Syne] Auto-handled prompt:', msg, '-> ', def || '');
+                    console.log('[Agent] Auto-handled prompt:', msg, '-> ', def || '');
                     return {'def || ""' if accept else "null"};
                 }};
                 return 'enabled';
@@ -1983,6 +2352,7 @@ def chrome_drag(
             },
         )
 
+        _trail_capture("drag", profile, page_idx, json.dumps({"from": from_selector, "to": to_selector}))
         return True, f"Dragged {from_selector} to {to_selector}"
     except Exception as e:
         return False, str(e)
@@ -2050,6 +2420,7 @@ def chrome_drag_coords(
             },
         )
 
+        _trail_capture("drag_coords", profile, page_idx, json.dumps({"from_x": from_x, "from_y": from_y, "to_x": to_x, "to_y": to_y}))
         return True, f"Dragged from ({from_x},{from_y}) to ({to_x},{to_y})"
     except Exception as e:
         return False, str(e)
@@ -2536,7 +2907,7 @@ def chrome_survey(profile: str, page_idx: int = 0) -> tuple[bool, dict, str]:
     """Survey page for all interactive elements with intelligent fallback.
 
     Args:
-        profile: REQUIRED. One of: "john" or "sandbox"
+        profile: REQUIRED. One of: "default" or "sandbox"
         page_idx: Tab index (default 0)
 
     Returns:
@@ -2649,7 +3020,7 @@ def chrome_act(
     """Act on element by index from last survey.
 
     Args:
-        profile: REQUIRED. One of: "john" or "sandbox"
+        profile: REQUIRED. One of: "default" or "sandbox"
         index: Element index from chrome_survey() (1-based)
         action: "click", "fill", "focus", "check", "uncheck" (default: "click")
         value: Text to fill (required for "fill" action)
@@ -2732,6 +3103,7 @@ def chrome_act(
                     "clickCount": 1,
                 },
             )
+            _trail_capture("act", profile, page_idx, json.dumps({"index": index, "action": "click"}))
             return (
                 True,
                 f"Clicked element {index} ({element.get('role', '?')}: {element.get('name', '')[:30]}) at ({x}, {y})",
@@ -2785,6 +3157,7 @@ def chrome_act(
                     "Input.dispatchKeyEvent", {"type": "char", "text": char}
                 )
 
+            _trail_capture("act", profile, page_idx, json.dumps({"index": index, "action": "fill", "value": value[:100]}))
             return (
                 True,
                 f"Filled element {index} with '{value[:30]}{'...' if len(value) > 30 else ''}'",
@@ -2811,6 +3184,7 @@ def chrome_act(
                     "clickCount": 1,
                 },
             )
+            _trail_capture("act", profile, page_idx, json.dumps({"index": index, "action": "focus"}))
             return True, f"Focused element {index}"
 
         elif action in ("check", "uncheck"):
@@ -2835,6 +3209,7 @@ def chrome_act(
                     "clickCount": 1,
                 },
             )
+            _trail_capture("act", profile, page_idx, json.dumps({"index": index, "action": action}))
             return (
                 True,
                 f"{'Checked' if action == 'check' else 'Unchecked'} element {index}",
@@ -2858,7 +3233,7 @@ def chrome_find(
     """Find elements matching a query string. Token-efficient alternative to full survey.
 
     Args:
-        profile: REQUIRED. One of: "john" or "sandbox"
+        profile: REQUIRED. One of: "default" or "sandbox"
         query: Text to search for in element names/roles (case-insensitive)
         limit: Maximum results to return (default 5)
         page_idx: Tab index (default 0)
@@ -2930,7 +3305,7 @@ def chrome_do(
     """Find element by query and act on it in one call. Most token-efficient interaction.
 
     Args:
-        profile: REQUIRED. One of: "john" or "sandbox"
+        profile: REQUIRED. One of: "default" or "sandbox"
         query: Text to search for in element names/roles
         action: "click", "fill", "focus", "check", "uncheck" (default: "click")
         value: Text to fill (required for "fill" action)
@@ -2941,8 +3316,8 @@ def chrome_do(
         (success, message)
 
     Example:
-        chrome_do("john", "submit", "click")  # Finds and clicks first "submit" element
-        chrome_do("john", "search", "fill", "my query")  # Finds search box and types
+        chrome_do("default", "submit", "click")  # Finds and clicks first "submit" element
+        chrome_do("default", "search", "fill", "my query")  # Finds search box and types
     """
     # Find matching elements
     success, matches, msg = chrome_find(
@@ -2969,6 +3344,7 @@ def chrome_do(
     success, result = chrome_act(profile, element_idx, action, value, page_idx)
 
     if success:
+        _trail_capture("do", profile, page_idx, json.dumps({"query": query, "action": action, "value": value}))
         return True, f"{result} (matched '{query}')"
     else:
         return False, result
@@ -2978,7 +3354,7 @@ def chrome_survey_compact(profile: str, page_idx: int = 0) -> tuple[bool, str, s
     """Get compact text list of elements. Minimal token usage.
 
     Args:
-        profile: REQUIRED. One of: "john" or "sandbox"
+        profile: REQUIRED. One of: "default" or "sandbox"
         page_idx: Tab index (default 0)
 
     Returns:
@@ -3446,16 +3822,156 @@ def handle_emulate(args):
             sys.exit(1)
 
 
+def handle_trail(args):
+    """Handle trail commands."""
+    action = getattr(args, "action", None)
+    if not action:
+        if args.command == "trail_start": action = "start"
+        elif args.command == "trail_stop": action = "stop"
+        elif args.command == "trail_status": action = "status"
+    
+    if action == "start":
+        success, path = chrome_trail_start(args.name)
+        print(json.dumps({"success": success, "trail_dir": path}, indent=2))
+        if not success: sys.exit(1)
+    elif action == "stop":
+        success, summary = chrome_trail_stop()
+        print(json.dumps({"success": success, **summary} if isinstance(summary, dict) else {"success": success, "result": summary}, indent=2))
+        if not success: sys.exit(1)
+    elif action == "status":
+        result = chrome_trail_status()
+        print(json.dumps(result, indent=2))
+
+
+def handle_headless(args):
+    """Handle headless commands."""
+    action = getattr(args, "action", None)
+    if not action:
+        if args.command == "headless_start": action = "start"
+        elif args.command == "headless_stop": action = "stop"
+        elif args.command == "headless_list": action = "list"
+        elif args.command == "headless_action": action = "action"
+    
+    if action == "start":
+        success, info, err = chrome_headless_start(args.name)
+        if success:
+            print(json.dumps({"success": True, **info}, indent=2))
+        else:
+            print(json.dumps({"success": False, "error": err}, indent=2))
+            sys.exit(1)
+    elif action == "stop":
+        success, msg = chrome_headless_stop(args.name)
+        print(json.dumps({"success": success, "message": msg}, indent=2))
+        if not success: sys.exit(1)
+    elif action == "list":
+        sessions = chrome_headless_list()
+        print(json.dumps(sessions, indent=2))
+    elif action == "action":
+        kwargs = {}
+        hl_args = args.hl_args or []
+        if args.command == "headless_action":
+            # CLI parity version
+            action_name = args.hl_action_name
+        else:
+            # Nested version
+            action_name = args.hl_action_name if hasattr(args, "hl_action_name") else None
+
+        if action_name == "goto" and hl_args:
+            kwargs["url"] = hl_args[0]
+        elif action_name == "click" and hl_args:
+            kwargs["selector"] = hl_args[0]
+        elif action_name == "fill" and len(hl_args) >= 2:
+            kwargs["selector"] = hl_args[0]
+            kwargs["value"] = hl_args[1]
+        elif action_name == "js" and hl_args:
+            kwargs["expression"] = hl_args[0]
+        elif action_name == "key" and hl_args:
+            kwargs["key_name"] = hl_args[0]
+
+        result = chrome_headless_action(args.name, action_name, **kwargs)
+        print(json.dumps(result, indent=2, default=str))
+
+
+
+def handle_trail(args):
+    """Handle trail commands."""
+    action = getattr(args, "action", None)
+    if not action:
+        if args.command == "trail_start": action = "start"
+        elif args.command == "trail_stop": action = "stop"
+        elif args.command == "trail_status": action = "status"
+    
+    if action == "start":
+        success, path = chrome_trail_start(args.name)
+        print(json.dumps({"success": success, "trail_dir": path}, indent=2))
+        if not success: sys.exit(1)
+    elif action == "stop":
+        success, summary = chrome_trail_stop()
+        print(json.dumps({"success": success, **summary} if isinstance(summary, dict) else {"success": success, "result": summary}, indent=2))
+        if not success: sys.exit(1)
+    elif action == "status":
+        result = chrome_trail_status()
+        print(json.dumps(result, indent=2))
+
+
+def handle_headless(args):
+    """Handle headless commands."""
+    action = getattr(args, "action", None)
+    if not action:
+        if args.command == "headless_start": action = "start"
+        elif args.command == "headless_stop": action = "stop"
+        elif args.command == "headless_list": action = "list"
+        elif args.command == "headless_action": action = "action"
+    
+    if action == "start":
+        success, info, err = chrome_headless_start(args.name)
+        if success:
+            print(json.dumps({"success": True, **info}, indent=2))
+        else:
+            print(json.dumps({"success": False, "error": err}, indent=2))
+            sys.exit(1)
+    elif action == "stop":
+        success, msg = chrome_headless_stop(args.name)
+        print(json.dumps({"success": success, "message": msg}, indent=2))
+        if not success: sys.exit(1)
+    elif action == "list":
+        sessions = chrome_headless_list()
+        print(json.dumps(sessions, indent=2))
+    elif action == "action":
+        kwargs = {}
+        hl_args = args.hl_args or []
+        if args.command == "headless_action":
+            # CLI parity version
+            action_name = args.hl_action_name
+        else:
+            # Nested version
+            action_name = args.hl_action_name if hasattr(args, "hl_action_name") else None
+
+        if action_name == "goto" and hl_args:
+            kwargs["url"] = hl_args[0]
+        elif action_name == "click" and hl_args:
+            kwargs["selector"] = hl_args[0]
+        elif action_name == "fill" and len(hl_args) >= 2:
+            kwargs["selector"] = hl_args[0]
+            kwargs["value"] = hl_args[1]
+        elif action_name == "js" and hl_args:
+            kwargs["expression"] = hl_args[0]
+        elif action_name == "key" and hl_args:
+            kwargs["key_name"] = hl_args[0]
+
+        result = chrome_headless_action(args.name, action_name, **kwargs)
+        print(json.dumps(result, indent=2, default=str))
+
 def main():
     # Logging
     _log("INFO", "start", f"Command: {sys.argv[1] if len(sys.argv) > 1 else '--help'}")
     profiles_help = ", ".join(f"{k} ({v['desc']})" for k, v in PROFILES.items())
     parser = argparse.ArgumentParser(
-        description="Syne Chrome - Multi-Profile Automation",
+        description="Agent Chrome - Multi-Profile Automation",
         epilog=f"Profiles: {profiles_help}",
     )
     # -V (capital) for version: lowercase -v reserved for future --verbose flag alignment
-    parser.add_argument("-V", "--version", action="version", version="1.1.0")
+    parser.add_argument("-V", "--version", action="version", version="1.2.0")
     parser.add_argument(
         "-M",
         "--help-markdown",
@@ -3758,6 +4274,53 @@ def main():
     )
     emu_net.add_argument("-i", "--page-idx", type=int, default=0)
 
+    # Trail Command Group
+    trail_parser = subparsers.add_parser("trail", help="Screenshot trail recording")
+    trail_subs = trail_parser.add_subparsers(dest="action", required=True)
+
+    trail_start_p = trail_subs.add_parser("start", help="Start recording trail")
+    trail_start_p.add_argument("name", help="Trail name (creates directory under /tmp)")
+
+    trail_subs.add_parser("stop", help="Stop recording trail")
+
+    trail_subs.add_parser("status", help="Show trail recording status")
+
+    # Headless Command Group
+    headless_parser = subparsers.add_parser("headless", help="Parallel headless sessions")
+    headless_subs = headless_parser.add_subparsers(dest="action", required=True)
+
+    hl_start = headless_subs.add_parser("start", help="Start headless session")
+    hl_start.add_argument("name", help="Session name")
+
+    hl_stop = headless_subs.add_parser("stop", help="Stop headless session")
+    hl_stop.add_argument("name", help="Session name")
+
+    headless_subs.add_parser("list", help="List active headless sessions")
+
+    hl_action = headless_subs.add_parser("action", help="Run action in headless session")
+    hl_action.add_argument("name", help="Session name")
+    hl_action.add_argument("hl_action_name", help="Action (goto, click, fill, etc.)")
+    hl_action.add_argument("hl_args", nargs="*", help="Action arguments")
+
+    # Replay Command
+    replay_parser = subparsers.add_parser("replay", help="Replay a recorded trail")
+    replay_parser.add_argument("script_path", help="Path to trail.json")
+    replay_parser.add_argument("-d", "--delay", type=float, default=0.5, help="Delay between steps (seconds)")
+
+    # Trail Command Group (Underscore versions for SFB parity)
+    subparsers.add_parser("trail_start", help="Start recording trail").add_argument("name")
+    subparsers.add_parser("trail_stop", help="Stop recording trail")
+    subparsers.add_parser("trail_status", help="Show trail recording status")
+
+    # Headless Command Group (Underscore versions for SFB parity)
+    subparsers.add_parser("headless_start", help="Start headless session").add_argument("name")
+    subparsers.add_parser("headless_stop", help="Stop headless session").add_argument("name")
+    subparsers.add_parser("headless_list", help="List active headless sessions")
+    hl_action_p = subparsers.add_parser("headless_action", help="Run action in headless session")
+    hl_action_p.add_argument("name")
+    hl_action_p.add_argument("hl_action_name")
+    hl_action_p.add_argument("hl_args", nargs="*")
+
     # MCP server subcommand
     subparsers.add_parser("mcp-stdio", help="Run as MCP stdio server")
 
@@ -3781,10 +4344,6 @@ def main():
 
     args = parser.parse_args()
 
-    # stdin support — read URL from pipe for navigate goto
-    if hasattr(args, "url") and not args.url and not sys.stdin.isatty():
-        args.url = sys.stdin.read().strip()
-
     # Resolve port from profile
     if args.port is None:
         args.port = get_port(args.profile)
@@ -3793,7 +4352,12 @@ def main():
         if args.command == "mcp-stdio":
             _run_mcp()
             return
-        elif args.command == "status":
+
+        # stdin support — read URL from pipe for navigate goto
+        if hasattr(args, "url") and not args.url and not sys.stdin.isatty():
+            args.url = sys.stdin.read().strip()
+
+        if args.command == "status":
             handle_status(args)
         elif args.command == "tabs":
             handle_tabs(args)
@@ -3802,6 +4366,16 @@ def main():
         elif args.command == "ensure":
             success, status_dict, msg = chrome_ensure(args.profile)
             print(json.dumps({"message": msg, "status": status_dict}, indent=2))
+        elif args.command in ("trail", "trail_start", "trail_stop", "trail_status"):
+            handle_trail(args)
+        elif args.command in (
+            "headless",
+            "headless_start",
+            "headless_stop",
+            "headless_list",
+            "headless_action",
+        ):
+            handle_headless(args)
         else:
             # All other commands need Chrome running — auto-launch if needed
             ensure_chrome_cli(args.profile, args.port)
@@ -3828,6 +4402,11 @@ def main():
                 handle_drag(args)
             elif args.command == "emulate":
                 handle_emulate(args)
+            elif args.command == "replay":
+                success, summary, err = chrome_replay(args.script_path, args.profile, args.delay)
+                print(json.dumps({"success": success, **summary}, indent=2, default=str))
+                if not success:
+                    sys.exit(1)
     except (AssertionError, Exception) as e:
         _log("ERROR", args.command or "unknown", str(e))
         print(f"Error: {e}", file=sys.stderr)
@@ -3855,7 +4434,7 @@ def _run_mcp():
         """Screenshot the current browser tab. Returns image inline.
 
         Args:
-            profile: Chrome profile - "john" or "sandbox"
+            profile: Chrome profile - "default" or "sandbox"
             page_idx: Tab index (default 0, first tab)
             full_page: Capture entire scrollable page (default: viewport only)
             selector: Capture specific element only (CSS selector)
@@ -4127,7 +4706,7 @@ def _run_mcp():
         """Kill Chrome instance(s).
 
         Args:
-            target: Profile name ("john" or "sandbox") or "all"
+            target: Profile name ("default" or "sandbox") or "all"
         """
         return chrome_kill(target)
 
@@ -4385,6 +4964,148 @@ def _run_mcp():
         if not success:
             raise ValueError(msg)
         return msg
+
+    # --- Trail tools ---
+
+    @mcp.tool()
+    def trail_start(name: str) -> str:
+        """Start recording a screenshot trail. Captures screenshots after every action.
+
+        Args:
+            name: Trail name (creates directory under data/chrome_trails/)
+        """
+        success, path = chrome_trail_start(name)
+        if not success:
+            raise ValueError(path)
+        return f"Trail started: {path}"
+
+    @mcp.tool()
+    def trail_stop() -> str:
+        """Stop recording the active trail. Saves trail.json for replay.
+
+        Args:
+            None
+        """
+        success, summary = chrome_trail_stop()
+        if not success:
+            raise ValueError(str(summary))
+        return json.dumps(summary)
+
+    @mcp.tool()
+    def trail_status() -> str:
+        """Check if a trail is currently recording.
+
+        Args:
+            None
+        """
+        result = chrome_trail_status()
+        return json.dumps(result)
+
+    # --- Headless session tools ---
+
+    @mcp.tool()
+    def headless_start(name: str) -> str:
+        """Start a headless Chrome session for parallel automation.
+
+        Args:
+            name: Unique session name
+        """
+        success, info, err = chrome_headless_start(name)
+        if not success:
+            raise ValueError(err)
+        return json.dumps(info)
+
+    @mcp.tool()
+    def headless_stop(name: str) -> str:
+        """Stop a headless Chrome session.
+
+        Args:
+            name: Session name to stop
+        """
+        success, msg = chrome_headless_stop(name)
+        if not success:
+            raise ValueError(msg)
+        return msg
+
+    @mcp.tool()
+    def headless_list() -> str:
+        """List all active headless Chrome sessions.
+
+        Args:
+            None
+        """
+        sessions = chrome_headless_list()
+        return json.dumps(sessions)
+
+    @mcp.tool()
+    def headless_action(
+        name: str,
+        action: str,
+        url: str = "",
+        selector: str = "",
+        value: str = "",
+        expression: str = "",
+        key_name: str = "",
+        text: str = "",
+        query: str = "",
+        direction: str = "down",
+        amount: int = 3,
+        timeout: int = 10,
+    ) -> str:
+        """Run an action in a headless Chrome session.
+
+        Args:
+            name: Session name
+            action: Action to run (goto, click, fill, js, key, look, read, wait, hover, scroll, survey, find, do)
+            url: URL for goto action
+            selector: CSS selector for click/fill/hover/scroll
+            value: Value for fill action
+            expression: JS expression for js action
+            key_name: Key name for key action
+            text: Text for wait action
+            query: Query for find/do action
+            direction: Scroll direction (up/down/left/right)
+            amount: Scroll amount (ticks)
+            timeout: Wait timeout (seconds)
+        """
+        kwargs = {}
+        if url:
+            kwargs["url"] = url
+        if selector:
+            kwargs["selector"] = selector
+        if value:
+            kwargs["value"] = value
+        if expression:
+            kwargs["expression"] = expression
+        if key_name:
+            kwargs["key"] = key_name
+        if text:
+            kwargs["text"] = text
+        if query:
+            kwargs["query"] = query
+        if action == "scroll":
+            kwargs["direction"] = direction
+            kwargs["amount"] = amount
+        if action == "wait":
+            kwargs["timeout"] = timeout
+        result = chrome_headless_action(name, action, **kwargs)
+        return json.dumps(result, default=str)
+
+    # --- Replay tool ---
+
+    @mcp.tool()
+    def replay(script_path: str, profile: str, delay: float = 0.5) -> str:
+        """Replay a recorded trail against a browser profile.
+
+        Args:
+            script_path: Path to trail.json file
+            profile: Target Chrome profile
+            delay: Delay between steps in seconds (default 0.5)
+        """
+        success, summary, err = chrome_replay(script_path, profile, delay)
+        if not success:
+            raise ValueError(err or "Replay had failures")
+        return json.dumps(summary, default=str)
 
     print("chrome MCP server starting...", file=sys.stderr)
     mcp.run(transport="stdio")
